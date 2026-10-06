@@ -183,6 +183,12 @@ fn verify_ioa_sources(ioa_sources: &std::collections::BTreeMap<String, String>) 
             for level in &result.levels {
                 let status = if level.passed { "PASS" } else { "FAIL" };
                 println!("    [{status}] {}", level.summary);
+                // Detail lines localise the failure. Without them a failed
+                // level reports only a count, and bisecting the spec is the
+                // only way to find out which property broke.
+                for line in &level.diagnostics {
+                    println!("           {line}");
+                }
             }
             if !result.all_passed {
                 anyhow::bail!("IOA verification failed for entity '{entity_name}'");

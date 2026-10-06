@@ -69,6 +69,9 @@ pub async fn run(
         for level in &result.levels {
             let status = if level.passed { "PASS" } else { "FAIL" };
             write_stdout_line(format!("    [{status}] {}", level.summary));
+            for line in &level.diagnostics {
+                write_stdout_line(format!("           {line}"));
+            }
         }
         if !result.all_passed {
             anyhow::bail!("remote IOA verification failed for entity '{entity_name}'");
