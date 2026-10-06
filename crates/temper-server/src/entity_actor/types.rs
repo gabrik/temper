@@ -180,6 +180,11 @@ pub struct EntityEvent {
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Canonical request binding (`idempotency::request_binding`) of the
+    /// request that used `idempotency_key` (ADR-0182). Absent on legacy events,
+    /// which are verified from `action` + `params` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_binding: Option<String>,
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.

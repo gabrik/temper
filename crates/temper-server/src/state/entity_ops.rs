@@ -1297,6 +1297,7 @@ impl ServerState {
             timestamp: sim_now(),
             params: initial_fields,
             idempotency_key: None,
+            idempotency_binding: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;

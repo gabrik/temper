@@ -772,6 +772,17 @@ impl crate::state::ServerState {
             }
         };
 
+        // ADR-0182: a mismatched or unverifiable idempotency key is a typed
+        // client error. It committed nothing, so no post-dispatch effect runs.
+        if !response.success
+            && let Some(error) =
+                DispatchError::from_idempotency_rejection(response.error.as_deref())
+        {
+            tracing::Span::current().record("success", false);
+            tracing::Span::current().record("error_msg", error.to_string().as_str());
+            return Err(error);
+        }
+
         // Run all post-dispatch effects through the dedicated pipeline.
         let ctx = PostDispatchContext {
             tenant,

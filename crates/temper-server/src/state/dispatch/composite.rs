@@ -516,6 +516,7 @@ impl crate::state::ServerState {
                 timestamp: sim_now(),
                 params: serde_json::json!({}),
                 idempotency_key: None,
+                idempotency_binding: None,
             };
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
@@ -852,6 +853,7 @@ impl crate::state::ServerState {
                 timestamp: sim_now(),
                 params: serde_json::json!({}),
                 idempotency_key: None,
+                idempotency_binding: None,
             };
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);

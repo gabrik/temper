@@ -2560,6 +2560,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         timestamp: sim_now(),
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
+        idempotency_binding: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,

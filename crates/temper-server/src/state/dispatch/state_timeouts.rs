@@ -526,6 +526,7 @@ mod tests {
             timestamp: ts,
             params: serde_json::json!({}),
             idempotency_key: None,
+            idempotency_binding: None,
         }
     }
 

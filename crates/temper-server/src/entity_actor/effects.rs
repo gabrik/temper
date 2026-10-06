@@ -397,6 +397,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 timestamp: sim_now(),
                 params: params.clone(),
                 idempotency_key: None,
+                idempotency_binding: None,
             };
 
             ProcessResult {
@@ -575,7 +576,7 @@ fn validate_ref_action_contract(
     }
 }
 
-fn normalize_ref_action_params<'a>(
+pub(crate) fn normalize_ref_action_params<'a>(
     state: &EntityState,
     action: &str,
     params: &'a serde_json::Value,
