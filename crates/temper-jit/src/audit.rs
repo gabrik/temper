@@ -117,10 +117,18 @@ impl EntitySnapshot {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default()))
         };
+        let mut counters: BTreeMap<String, usize> =
+            serde_json::from_value(sub("counters")).unwrap_or_default();
+        // Match the runtime's legacy `items` fallback; named counters win.
+        if let Some(count) = row.get("item_count").and_then(Value::as_u64)
+            && let Ok(count) = usize::try_from(count)
+        {
+            counters.entry("items".to_string()).or_insert(count);
+        }
         Ok(Self {
             entity_id,
             status,
-            counters: serde_json::from_value(sub("counters")).unwrap_or_default(),
+            counters,
             booleans: serde_json::from_value(sub("booleans")).unwrap_or_default(),
             lists: serde_json::from_value(sub("lists")).unwrap_or_default(),
             fields: serde_json::from_value(sub("fields")).unwrap_or_default(),
@@ -273,6 +281,7 @@ fn audit_liveness(
         return findings;
     }
 
+    let mut unresolved = Vec::new();
     let enabled: Vec<&str> = automaton
         .actions
         .iter()
@@ -282,12 +291,32 @@ fn audit_liveness(
             } else {
                 action.from.contains(&snapshot.status)
             };
-            from_ok && guard::check(&action.guard, &snapshot.status, ctx, declared)
+            if !from_ok {
+                return false;
+            }
+            if !action.guard.cross_refs().is_empty() {
+                unresolved.push(action.name.as_str());
+                return false;
+            }
+            guard::check(&action.guard, &snapshot.status, ctx, declared)
         })
         .map(|action| action.name.as_str())
         .collect();
 
-    if enabled.is_empty() {
+    if enabled.is_empty() && !unresolved.is_empty() {
+        findings.push(AuditFinding {
+            entity_id: snapshot.entity_id.clone(),
+            code: "liveness_not_evaluated".to_string(),
+            severity: AuditSeverity::Warning,
+            status: snapshot.status.clone(),
+            message: format!(
+                "cannot determine whether state '{}' is stranded: {} read other entities, which this audit does not resolve",
+                snapshot.status,
+                unresolved.join(", ")
+            ),
+            found: vec![],
+        });
+    } else if enabled.is_empty() {
         // Strictly worse than sitting in a transient state: there is no legal
         // move out, so no retry, callback or operator action can help. The
         // entity is finished without being in a state declared as finished.

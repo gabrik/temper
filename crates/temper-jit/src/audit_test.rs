@@ -312,3 +312,42 @@ fn a_repo_spec_invariant_is_enforced_against_live_data() {
         audit_entity(&order, &healthy)
     );
 }
+
+#[test]
+fn unresolved_cross_entity_guard_does_not_prove_stranding() {
+    let source = SPEC.replace(
+        "name = \"Succeed\"\nkind = \"input\"\nfrom = [\"Analyzing\"]\nto = \"Analyzed\"",
+        "name = \"Succeed\"\nkind = \"input\"\nfrom = [\"Analyzing\"]\nto = \"Analyzed\"\nguard = \"Workspace[workspace_id].status in ['Active']\"",
+    );
+    let automaton = parse_automaton(&source).expect("parses");
+    let mut entity = snapshot("inc-cross", "Analyzing");
+    entity.counters.insert("observations".into(), 1);
+    entity
+        .fields
+        .insert("workspace_id".into(), serde_json::json!("ws-1"));
+    let findings = audit_entity(&automaton, &entity);
+    assert!(
+        !findings.iter().any(|f| f.code == "entity_stranded"),
+        "{findings:#?}"
+    );
+    assert!(
+        findings.iter().any(|f| f.code == "liveness_not_evaluated"),
+        "{findings:#?}"
+    );
+}
+
+#[test]
+fn legacy_item_count_matches_runtime_counter_fallback() {
+    let order =
+        parse_automaton(include_str!("../../../test-fixtures/specs/order.ioa.toml")).unwrap();
+    let mut row = serde_json::json!({
+        "entity_id": "legacy-order", "status": "Submitted", "item_count": 2,
+        "counters": {}, "booleans": {"has_address": true}, "fields": {}
+    });
+    let snapshot = EntitySnapshot::from_tdata_row(&row).unwrap();
+    assert!(!audit_entities(&order, &[snapshot]).has_violations());
+    // An explicit counter overrides the compatibility field, as in the runtime.
+    row["counters"] = serde_json::json!({"items": 0});
+    let snapshot = EntitySnapshot::from_tdata_row(&row).unwrap();
+    assert!(audit_entities(&order, &[snapshot]).has_violations());
+}

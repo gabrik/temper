@@ -9,7 +9,7 @@
 //! it found; deciding whether a finding means the spec is wrong or the data is
 //! is left to the reader.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -214,25 +214,40 @@ async fn fetch_rows(
     token: Option<&str>,
     tenant: Option<&str>,
 ) -> Result<Option<Vec<serde_json::Value>>> {
-    let url = format!("{base}/tdata/{set}?$top={PAGE_LIMIT}");
-    let body = match read_tdata(client, &url, token, tenant).await? {
-        Read::Body(body) => body,
-        Read::Forbidden => return Ok(None),
-    };
-    let rows = body
-        .get("value")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if rows.len() == PAGE_LIMIT {
-        // Paging is not implemented, so say that the answer is partial rather
-        // than report a clean audit of the first page.
-        eprintln!(
-            "  warning: '{set}' returned the {PAGE_LIMIT}-row page limit; \
-             entities beyond the first page were not audited"
-        );
+    let mut url = reqwest::Url::parse(&format!("{base}/tdata/{set}?$top={PAGE_LIMIT}"))?;
+    let origin = url.origin();
+    let mut visited = BTreeSet::new();
+    let mut rows = Vec::new();
+    loop {
+        if !visited.insert(url.to_string()) {
+            anyhow::bail!("repeated audit continuation for '{set}': {url}");
+        }
+        let body = match read_tdata(client, url.as_str(), token, tenant).await? {
+            Read::Body(body) => body,
+            Read::Forbidden if visited.len() == 1 => return Ok(None),
+            Read::Forbidden => {
+                anyhow::bail!("continuation for '{set}' refused the read; audit is incomplete")
+            }
+        };
+        let page = body
+            .get("value")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| format!("GET {url} has no collection `value` array"))?;
+        rows.extend(page.iter().cloned());
+        match body.get("@odata.nextLink") {
+            None => return Ok(Some(rows)),
+            Some(next) => {
+                let next = next.as_str().context("invalid audit continuation link")?;
+                let next = url.join(next)?;
+                // Continuations retain authorization, so never send them to
+                // another origin, even if the response advertises one.
+                if next.origin() != origin {
+                    anyhow::bail!("cross-origin audit continuation for '{set}'");
+                }
+                url = next;
+            }
+        }
     }
-    Ok(Some(rows))
 }
 
 /// What a `/tdata` read produced.
@@ -326,3 +341,7 @@ fn read_automata(specs_dir: &Path) -> Result<BTreeMap<String, Automaton>> {
     }
     Ok(automata)
 }
+
+#[cfg(test)]
+#[path = "audit_test.rs"]
+mod tests;
