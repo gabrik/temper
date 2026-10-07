@@ -3,6 +3,7 @@
 //! Apply is not here. Production apply is `temper-server` `entity_actor/effects.rs`.
 //! Postgres actors and verify each have their own interpreter.
 
+pub mod audit;
 pub mod shadow;
 pub mod swap;
 pub mod table;

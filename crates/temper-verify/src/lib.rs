@@ -12,6 +12,7 @@
 pub mod cascade;
 pub mod checker;
 pub mod composite;
+pub mod diagnostics;
 pub mod model;
 pub mod paths;
 pub mod proptest_gen;

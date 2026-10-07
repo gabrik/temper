@@ -10,6 +10,7 @@
 //! Each level produces a pass/fail result. All levels run independently.
 
 use crate::checker::{self, VerificationResult};
+use crate::diagnostics;
 use crate::model::{self, TemperModel};
 use crate::proptest_gen::{self, PropTestResult};
 use crate::simulation::{self, SimConfig, SimulationResult};
@@ -72,6 +73,16 @@ pub struct LevelResult {
     pub passed: bool,
     /// A human-readable summary of the result.
     pub summary: String,
+    /// Actionable detail lines for a failure: the violated invariant, the
+    /// action that broke it, the states either side, the seed to replay.
+    ///
+    /// Empty on a passing level. Rendered by [`crate::diagnostics`] from the
+    /// level-specific results below, which already carry the detail; before
+    /// this field existed that detail was computed and then discarded, leaving
+    /// a bare count as the only output. `#[serde(default)]` so a result
+    /// decoded from an older server still deserialises.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
     /// Detailed results (level-specific).
     pub verification: Option<VerificationResult>,
     pub simulation: Option<SimulationResult>,
@@ -395,6 +406,11 @@ impl VerificationCascade {
             level: CascadeLevel::SymbolicVerification,
             passed,
             summary,
+            diagnostics: if passed {
+                Vec::new()
+            } else {
+                diagnostics::smt_diagnostics(&result)
+            },
             verification: None,
             simulation: None,
             prop_test: None,
@@ -437,6 +453,11 @@ impl VerificationCascade {
             level: CascadeLevel::ModelCheck,
             passed,
             summary,
+            diagnostics: if passed {
+                Vec::new()
+            } else {
+                diagnostics::model_check_diagnostics(&verification)
+            },
             verification: Some(verification),
             simulation: None,
             prop_test: None,
@@ -473,6 +494,13 @@ impl VerificationCascade {
             .flat_map(|r| r.liveness_violations.clone())
             .collect();
 
+        // Name the broken invariants in the summary itself. A count answers
+        // "is it broken"; only a name answers "what do I look at", and the
+        // summary is the one line every caller prints.
+        let mut broken: Vec<&str> = violations.iter().map(|v| v.invariant.as_str()).collect();
+        broken.sort_unstable();
+        broken.dedup();
+
         let summary = if all_passed {
             format!(
                 "L2 Simulation PASSED: {} seeds, {} transitions, {} dropped msgs",
@@ -480,24 +508,39 @@ impl VerificationCascade {
             )
         } else if !invariants_ok {
             format!(
-                "L2 Simulation FAILED: {} invariant violation(s) across {} seeds",
+                "L2 Simulation FAILED: {} invariant violation(s) across {} seeds; broken: {}",
                 violations.len(),
                 self.sim_seeds,
+                broken.join(", "),
             )
         } else {
+            let mut properties: Vec<&str> = liveness_violations
+                .iter()
+                .map(|v| v.property.as_str())
+                .collect();
+            properties.sort_unstable();
+            properties.dedup();
             format!(
-                "L2 Simulation FAILED: {} liveness violation(s) across {} seeds",
+                "L2 Simulation FAILED: {} liveness violation(s) across {} seeds; broken: {}",
                 liveness_violations.len(),
                 self.sim_seeds,
+                properties.join(", "),
             )
         };
 
-        let representative = results.into_iter().next();
+        let diagnostics = if all_passed {
+            Vec::new()
+        } else {
+            diagnostics::simulation_diagnostics(&results)
+        };
+
+        let representative = failing_representative(results);
 
         LevelResult {
             level: CascadeLevel::Simulation,
             passed: all_passed,
             summary,
+            diagnostics,
             verification: None,
             simulation: representative,
             prop_test: None,
@@ -538,6 +581,11 @@ impl VerificationCascade {
             level: CascadeLevel::PropertyTest,
             passed,
             summary,
+            diagnostics: if passed {
+                Vec::new()
+            } else {
+                diagnostics::prop_test_diagnostics(&result)
+            },
             verification: None,
             simulation: None,
             prop_test: Some(result),
@@ -562,12 +610,28 @@ impl VerificationCascade {
             level: CascadeLevel::ActorSimulation,
             passed: result.all_invariants_held,
             summary,
+            diagnostics: Vec::new(),
             verification: None,
             simulation: None,
             prop_test: None,
             smt: None,
         }
     }
+}
+
+/// The result worth attaching to a level: a failing seed's, when one failed.
+///
+/// Seeds fail independently, so `results[0]` is frequently a passing run whose
+/// `violations` list is empty. Attaching it left a failed level carrying no
+/// violations at all -- which reads as a tooling bug, and sent the reader back
+/// to bisecting the spec by hand. Falls back to the first result so a passing
+/// run still reports its transition counts.
+fn failing_representative(results: Vec<SimulationResult>) -> Option<SimulationResult> {
+    results
+        .iter()
+        .find(|r| !r.all_invariants_held || !r.liveness_violations.is_empty())
+        .cloned()
+        .or_else(|| results.into_iter().next())
 }
 
 /// Build a [`CompositeCascadeReport`] from the configured scope, appending
@@ -604,6 +668,49 @@ mod tests {
     use super::*;
 
     const ORDER_IOA: &str = include_str!("../../../test-fixtures/specs/order.ioa.toml");
+
+    fn sim_result(seed: u64, healthy: bool) -> SimulationResult {
+        SimulationResult {
+            all_invariants_held: healthy,
+            ticks: 10,
+            total_transitions: 10,
+            total_messages: 10,
+            total_dropped: 0,
+            total_rejected: 0,
+            violations: Vec::new(),
+            liveness_violations: Vec::new(),
+            seed,
+            actor_final_states: Vec::new(),
+        }
+    }
+
+    /// Taking `results[0]` attaches a passing seed to a failed level. This
+    /// fails if `failing_representative` is reduced to `.into_iter().next()`.
+    #[test]
+    fn representative_prefers_a_failing_seed_over_the_first() {
+        let results = vec![
+            sim_result(1, true),
+            sim_result(2, true),
+            sim_result(3, false),
+        ];
+        let chosen = failing_representative(results).expect("a result");
+        assert_eq!(
+            chosen.seed, 3,
+            "a failed level must attach the seed that actually failed"
+        );
+    }
+
+    #[test]
+    fn representative_falls_back_to_the_first_when_every_seed_passed() {
+        let results = vec![sim_result(7, true), sim_result(8, true)];
+        let chosen = failing_representative(results).expect("a result");
+        assert_eq!(chosen.seed, 7);
+    }
+
+    #[test]
+    fn representative_of_no_seeds_is_none() {
+        assert!(failing_representative(Vec::new()).is_none());
+    }
 
     #[test]
     fn test_full_cascade_passes_ioa() {
