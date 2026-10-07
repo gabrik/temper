@@ -26,9 +26,10 @@ const PAGE_LIMIT: usize = 500;
 pub async fn run(specs_dir: &str, base_url: &str, tenant: Option<&str>) -> Result<()> {
     let specs_path = Path::new(specs_dir);
     let base = base_url.trim_end_matches('/');
-    println!("Audit");
-    println!("  Specs directory: {}", specs_path.display());
-    println!("  Server: {base}");
+    println!(
+        "Audit\n  Specs directory: {}\n  Server: {base}",
+        specs_path.display()
+    );
 
     let automata = read_automata(specs_path)?;
     if automata.is_empty() {
@@ -87,28 +88,50 @@ pub async fn run(specs_dir: &str, base_url: &str, tenant: Option<&str>) -> Resul
             refused.len()
         );
     }
+    let (output, violations) = render_reports(&automata, &by_type, &refused, undecodable);
+    println!("{output}");
+    if violations > 0 {
+        // A non-zero exit so CI can gate on this. Warnings do not fail: they
+        // are point-in-time observations, and failing on them would make the
+        // command flaky by design.
+        anyhow::bail!("{violations} invariant violation(s) in live data");
+    }
+    Ok(())
+}
+
+/// Render one complete report separately from terminal I/O so every finding
+/// and coverage warning can be checked together.
+fn render_reports(
+    automata: &BTreeMap<String, Automaton>,
+    by_type: &BTreeMap<String, Vec<EntitySnapshot>>,
+    refused: &[&String],
+    undecodable: usize,
+) -> (String, usize) {
+    let mut lines = Vec::new();
     if !refused.is_empty() {
         // Said once, plainly, rather than per set: on a stock server most of
         // these are Temper's own internals and the refusal is correct.
-        println!("\n  sets not authorized for this token, not audited: {refused:?}");
+        lines.push(format!(
+            "\n  sets not authorized for this token, not audited: {refused:?}"
+        ));
     }
 
     let mut violations = 0usize;
     let mut warnings = 0usize;
     let mut audited = 0usize;
-    for (name, automaton) in &automata {
+    for (name, automaton) in automata {
         let snapshots = by_type.get(name).map(Vec::as_slice).unwrap_or_default();
         let report = audit_entities(automaton, snapshots);
         audited += report.entities_audited;
-        println!(
+        lines.push(format!(
             "\n  {name}: {} entities, {} with violations",
             report.entities_audited, report.entities_violating
-        );
+        ));
         if snapshots.is_empty() {
             // Not a pass. An empty set proves nothing about the spec, and
             // saying "0 violations" without saying "0 entities" is how an
             // audit comes to be trusted for something it never checked.
-            println!("        no entities of this type exist; nothing was checked");
+            lines.push("        no entities of this type exist; nothing was checked".to_string());
             continue;
         }
         for finding in &report.findings {
@@ -122,17 +145,17 @@ pub async fn run(specs_dir: &str, base_url: &str, tenant: Option<&str>) -> Resul
                     "WARNING"
                 }
             };
-            println!(
+            lines.push(format!(
                 "    [{label}] {} ({}): {}",
                 finding.entity_id, finding.status, finding.message
-            );
+            ));
             if !finding.found.is_empty() {
                 let read: Vec<String> = finding
                     .found
                     .iter()
                     .map(|(name, value)| format!("{name}={value}"))
                     .collect();
-                println!("           read: {}", read.join(", "));
+                lines.push(format!("           read: {}", read.join(", ")));
             }
         }
     }
@@ -142,20 +165,20 @@ pub async fn run(specs_dir: &str, base_url: &str, tenant: Option<&str>) -> Resul
         .filter(|name| !automata.contains_key(*name))
         .collect();
     if !unmatched.is_empty() {
-        println!("\n  entity types with no local spec, not audited: {unmatched:?}");
+        lines.push(format!(
+            "\n  entity types with no local spec, not audited: {unmatched:?}"
+        ));
     }
 
-    println!("\n  {audited} entities audited: {violations} violation(s), {warnings} warning(s)");
+    lines.push(format!(
+        "\n  {audited} entities audited: {violations} violation(s), {warnings} warning(s)"
+    ));
     if undecodable > 0 {
-        println!("  {undecodable} row(s) could not be read and were not audited");
+        lines.push(format!(
+            "  {undecodable} row(s) could not be read and were not audited"
+        ));
     }
-    if violations > 0 {
-        // A non-zero exit so CI can gate on this. Warnings do not fail: they
-        // are point-in-time observations, and failing on them would make the
-        // command flaky by design.
-        anyhow::bail!("{violations} invariant violation(s) in live data");
-    }
-    Ok(())
+    (lines.join("\n"), violations)
 }
 
 /// Add the credential and tenant headers `/tdata` requires.
@@ -275,11 +298,14 @@ fn refusal(
     token: Option<&str>,
     tenant: Option<&str>,
 ) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
+        return format!(
+            "GET {url} returned {status}; the bearer token was rejected -- verify or refresh TEMPER_TOKEN"
+        );
+    }
     match (token.is_some(), tenant.is_some()) {
         (true, true) => format!(
-            "GET {url} returned {status}; a bearer token and a tenant were both sent, so the \
-             credentials are not the problem -- this tenant's Cedar policy does not grant read \
-             on it"
+            "GET {url} returned {status}; access was refused -- verify the tenant scope and its Cedar read policy"
         ),
         (false, true) => {
             format!("GET {url} returned {status}; no bearer token was sent -- set TEMPER_TOKEN")
@@ -309,7 +335,12 @@ async fn read_tdata(
         .text()
         .await
         .unwrap_or_else(|_| "<unreadable response body>".to_string());
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // Authentication failures invalidate the audit, unlike a forbidden
+        // internal entity set. Preserve the status and identify token repair.
+        anyhow::bail!(refusal(url, status, token, tenant));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
         return Ok(Read::Forbidden);
     }
     if !status.is_success() {

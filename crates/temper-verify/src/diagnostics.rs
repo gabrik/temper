@@ -127,17 +127,16 @@ fn render_trace(
     )],
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    for (index, (state, action)) in trace.iter().take(MAX_TRACE_STEPS).enumerate() {
+    let start = trace.len().saturating_sub(MAX_TRACE_STEPS);
+    if start > 0 {
+        lines.push(format!("    ... {start} earlier trace entries omitted"));
+    }
+    // Retain the final state and its incoming action: they locate the failure.
+    for (index, (state, action)) in trace.iter().enumerate().skip(start) {
         match action {
             Some(action) => lines.push(format!("    {index}. {state} --{action}")),
             None => lines.push(format!("    {index}. {state}")),
         }
-    }
-    if trace.len() > MAX_TRACE_STEPS {
-        lines.push(format!(
-            "    ... and {} further step(s)",
-            trace.len() - MAX_TRACE_STEPS
-        ));
     }
     lines
 }
@@ -178,7 +177,11 @@ pub fn simulation_diagnostics(results: &[SimulationResult]) -> Vec<String> {
                 .entry(key)
                 .and_modify(|group| {
                     group.count += 1;
-                    group.seed = group.seed.min(result.seed);
+                    if result.seed < group.seed {
+                        group.seed = result.seed;
+                        group.before = violation.state_before.to_string();
+                        group.after = violation.state_after.to_string();
+                    }
                 })
                 .or_insert_with(|| ViolationGroup {
                     invariant: violation.invariant.clone(),
@@ -327,14 +330,48 @@ mod tests {
 
     #[test]
     fn groups_repeated_violations_and_keeps_the_lowest_seed() {
+        let mut lower_seed = violation("Inv", "Act");
+        lower_seed.state_before = state("LowerBefore", 4);
+        lower_seed.state_after = state("LowerAfter", 5);
         let results = vec![
             sim_result(4, vec![violation("Inv", "Act")]),
-            sim_result(2, vec![violation("Inv", "Act"), violation("Inv", "Act")]),
+            sim_result(2, vec![lower_seed, violation("Inv", "Act")]),
         ];
         let lines = simulation_diagnostics(&results);
         let first = &lines[0];
         assert!(first.contains("3 occurrence(s)"), "{first}");
         assert!(first.contains("seed 2"), "{first}");
+        assert!(
+            first.contains("LowerBefore") && first.contains("LowerAfter"),
+            "{first}"
+        );
+        assert!(!first.contains("Analyzing"), "{first}");
+    }
+
+    #[test]
+    fn long_trace_keeps_the_failure_and_its_incoming_action() {
+        use crate::model::TemperModelAction;
+        let mut trace: Vec<_> = (0..20)
+            .map(|index| {
+                (
+                    state("Running", index),
+                    Some(TemperModelAction {
+                        name: format!("Action{index}"),
+                        target_state: None,
+                        params: BTreeMap::new(),
+                    }),
+                )
+            })
+            .collect();
+        trace.push((state("Broken", 20), None));
+        let lines = render_trace(&trace);
+        let output = lines.join("\n");
+        assert!(
+            output.contains("Action19") && output.contains("20. Broken"),
+            "{output}"
+        );
+        assert!(output.contains("omitted"), "{output}");
+        assert!(lines.len() <= MAX_TRACE_STEPS + 1);
     }
 
     #[test]

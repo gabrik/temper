@@ -3,12 +3,12 @@
 //! Split out of the parent module to stay inside the file-size budget. The
 //! check is self-contained: it reads an `Automaton` and nothing else.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::LintFinding;
 use crate::automaton::types::Action;
 use crate::automaton::{ActionKind, Automaton};
-use crate::predicate::{Arg, AssignOp, Effect};
+use crate::predicate::{Arg, AssignOp, Effect, Env, Literal, Val, eval};
 
 /// Flag a literal write that can silently absorb a concurrent write, in a
 /// state whose invariant polices the variable written.
@@ -80,7 +80,7 @@ pub(super) fn lint(automaton: &Automaton, findings: &mut Vec<LintFinding>) {
                     None => true,
                     Some(landing) => sources.contains(landing),
                 };
-                if !leaves_a_enabled {
+                if !leaves_a_enabled || !guard_may_hold_after(action, other, &overlap) {
                     continue;
                 }
                 findings.push(LintFinding::warning(
@@ -112,6 +112,46 @@ pub(super) fn lint(automaton: &Automaton, findings: &mut Vec<LintFinding>) {
             }
         }
     }
+}
+
+/// Suppress a collision only when known post-effect values prove the guard
+/// false. Everything else stays unknown, so this remains a conservative lint.
+fn guard_may_hold_after(action: &Action, other: &Action, overlap: &[&str]) -> bool {
+    struct PostEffect<'a> {
+        status: &'a str,
+        booleans: BTreeMap<&'a str, bool>,
+    }
+    impl Env for PostEffect<'_> {
+        fn status(&self) -> Val<'_> {
+            Val::Str(self.status)
+        }
+        fn var(&self, name: &str) -> Val<'_> {
+            self.booleans
+                .get(name)
+                .map_or(Val::Unknown, |value| Val::Bool(*value))
+        }
+        fn cross_statuses(&self, _: &str, _: &str) -> Option<Vec<Val<'_>>> {
+            None
+        }
+    }
+    let mut env = PostEffect {
+        status: "",
+        booleans: BTreeMap::new(),
+    };
+    for effect in &other.effect {
+        if let Effect::Assign { var, op, value } = effect {
+            // Effects are ordered. A later parameter-derived assignment
+            // invalidates an earlier literal, rather than proving exclusion.
+            env.booleans.remove(var.as_str());
+            if let (AssignOp::Set, Arg::Lit(Literal::Bool(value))) = (op, value) {
+                env.booleans.insert(var, *value);
+            }
+        }
+    }
+    overlap.iter().any(|source| {
+        env.status = other.to.as_deref().unwrap_or(source);
+        eval(&action.guard, &env).may_hold()
+    })
 }
 
 /// The variables an action assigns a bare literal to with `=`.

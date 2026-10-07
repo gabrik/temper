@@ -436,3 +436,27 @@ fn alternative_outcomes_of_one_operation_are_not_flagged() {
         "Observe exits every state Adopt fires from, so only one can apply: {findings:#?}"
     );
 }
+
+#[test]
+fn guard_exclusion_prevents_absorbing_effect_warning() {
+    let guarded = ABSORBING.replace(
+        "name = \"Adopt\"",
+        "name = \"Adopt\"\nguard = \"!has_verdict\"",
+    );
+    for (effect, should_warn) in [
+        ("has_verdict = true", false),
+        ("has_verdict = false", true),
+        ("has_verdict = true\", \"has_verdict = params.Changed", true),
+    ] {
+        let source = guarded.replace(
+            "content_changed = params.Changed",
+            &format!("content_changed = params.Changed\", \"{effect}"),
+        );
+        let findings = lint_automaton(&parse_automaton(&source).unwrap());
+        assert_eq!(
+            findings.iter().any(|f| f.code == "absorbing_effect"),
+            should_warn,
+            "{source}\n{findings:#?}"
+        );
+    }
+}

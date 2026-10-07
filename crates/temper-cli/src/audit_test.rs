@@ -66,3 +66,70 @@ async fn incomplete_or_unsafe_continuations_fail_the_audit() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn rejected_tokens_keep_401_and_request_credential_repair() {
+    use axum::http::StatusCode;
+    let app = Router::new()
+        .route("/tdata", get(|| async { StatusCode::UNAUTHORIZED }))
+        .route(
+            "/tdata/Insights",
+            get(|| async { StatusCode::UNAUTHORIZED }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let document = fetch_entity_sets(&client, &base, Some("expired"), Some("tenant"))
+        .await
+        .unwrap_err();
+    let collection = fetch_rows(&client, &base, "Insights", Some("expired"), Some("tenant"))
+        .await
+        .unwrap_err();
+    server.abort();
+    for error in [document, collection] {
+        let message = error.to_string();
+        assert!(
+            message.contains("401") && message.contains("TEMPER_TOKEN"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Cedar") && !message.contains("credentials are not the problem"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn report_rendering_preserves_findings_and_coverage_warnings() {
+    let order =
+        parse_automaton(include_str!("../../../test-fixtures/specs/order.ioa.toml")).unwrap();
+    let mut empty = order.clone();
+    empty.automaton.name = "Empty".into();
+    let automata = BTreeMap::from([("Order".into(), order), ("Empty".into(), empty)]);
+    let broken = EntitySnapshot::from_tdata_row(&serde_json::json!({
+        "entity_id": "order-1", "status": "Submitted", "counters": {"items": 0},
+        "booleans": {"has_address": true}, "fields": {}
+    }))
+    .unwrap();
+    let by_type = BTreeMap::from([("Order".into(), vec![broken]), ("Unmatched".into(), vec![])]);
+    let refused = "Policies".to_string();
+    let (output, violations) = render_reports(&automata, &by_type, &[&refused], 2);
+    assert!(violations > 0);
+    for expected in [
+        "Policies",
+        "Unmatched",
+        "Empty: 0 entities",
+        "nothing was checked",
+        "Order: 1 entities, 1 with violations",
+        "[VIOLATION] order-1",
+        "SubmitRequiresItems",
+        "items=0",
+        "1 entities audited",
+        "2 row(s) could not be read",
+    ] {
+        assert!(output.contains(expected), "missing {expected}: {output}");
+    }
+}
