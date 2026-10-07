@@ -185,6 +185,12 @@ pub struct EntityEvent {
     /// which are verified from `action` + `params` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_binding: Option<String>,
+    /// Immutable execution provenance (ADR-0182, review correction 2): digest
+    /// of the post-commit logical state this keyed request produced. A
+    /// duplicate is answered with 200 only if the state rebuilt for it still
+    /// hashes to this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_result: Option<String>,
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.

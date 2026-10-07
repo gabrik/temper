@@ -5,6 +5,7 @@ use tracing::{Instrument, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::entity_actor::{EntityMsg, EntityResponse};
+use crate::idempotency::EffectsClaim;
 use crate::request_context::{AgentContext, remote_parent_context};
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
@@ -794,14 +795,41 @@ impl crate::state::ServerState {
             action_params: &action_params,
             await_integration,
         };
-        let response = self.run_post_dispatch_effects(&ctx, response).await;
-        if response.success
-            && let Some(ref idem_key) = idempotency_key
-        {
-            let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-            self.idempotency_cache
-                .mark_effects_applied(&actor_key, idem_key);
-        }
+        // ADR-0182 review correction 1: only the dispatcher that claims a fresh
+        // commit runs its post-dispatch effects. Every other successful reply
+        // for the key is a replay of an earlier commit, not a new transition.
+        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
+        let claim = match idempotency_key.as_deref() {
+            Some(idem_key) if response.success => self
+                .idempotency_cache
+                .claim_post_dispatch_effects(&actor_key, idem_key),
+            _ => EffectsClaim::Owner,
+        };
+        let response = match claim {
+            EffectsClaim::Owner => {
+                let response = self.run_post_dispatch_effects(&ctx, response).await;
+                if let Some(ref idem_key) = idempotency_key {
+                    if response.success {
+                        self.idempotency_cache
+                            .mark_effects_applied(&actor_key, idem_key);
+                    } else {
+                        self.idempotency_cache
+                            .release_effects_claim(&actor_key, idem_key);
+                    }
+                }
+                response
+            }
+            EffectsClaim::Replay => {
+                tracing::debug!(tenant = %tenant, entity_type, entity_id, action,
+                    "idempotent replay: post-dispatch effects owned by the original commit");
+                response
+            }
+            EffectsClaim::HistoricalReplay => {
+                tracing::debug!(tenant = %tenant, entity_type, entity_id, action,
+                    "historical idempotent replay: no transition effects");
+                self.run_replayed_integrations(&ctx, response).await
+            }
+        };
         if response.success {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }
@@ -820,6 +848,94 @@ impl crate::state::ServerState {
         }
 
         Ok(response)
+    }
+
+    /// ADR-0182 review correction 1: a historical idempotent replay (rebuilt
+    /// from the journal) is not a newly committed transition, so it runs no
+    /// transition effects — no state timers, broadcasts, projection writes,
+    /// webhooks, spawns or scheduled actions. Only the composite triggers the
+    /// actor re-emitted for the duplicate are re-run (they are idempotent by
+    /// design), mirroring step 5 of `run_post_dispatch_effects`.
+    async fn run_replayed_integrations(
+        &self,
+        ctx: &PostDispatchContext<'_>,
+        response: EntityResponse,
+    ) -> EntityResponse {
+        if response.custom_effects.is_empty() {
+            return response;
+        }
+        if !ctx.await_integration {
+            self.dispatch_wasm_integrations(
+                ctx.tenant,
+                ctx.entity_type,
+                ctx.entity_id,
+                ctx.action,
+                &response.custom_effects,
+                &response.state,
+                ctx.agent_ctx,
+                ctx.action_params,
+            );
+            self.dispatch_adapter_integrations(super::adapter::AdapterDispatchInput {
+                tenant: ctx.tenant,
+                entity_type: ctx.entity_type,
+                entity_id: ctx.entity_id,
+                action: ctx.action,
+                custom_effects: &response.custom_effects,
+                entity_state: &response.state,
+                agent_ctx: ctx.agent_ctx,
+                action_params: ctx.action_params,
+            });
+            return response;
+        }
+
+        let failed = |error: String| EntityResponse {
+            success: false,
+            state: response.state.clone(),
+            error: Some(error),
+            custom_effects: response.custom_effects.clone(),
+            scheduled_actions: Vec::new(),
+            spawn_requests: Vec::new(),
+            spec_governed: response.spec_governed,
+        };
+        let wasm_req = super::WasmDispatchRequest {
+            tenant: ctx.tenant,
+            entity_type: ctx.entity_type,
+            entity_id: ctx.entity_id,
+            action: ctx.action,
+            custom_effects: &response.custom_effects,
+            entity_state: &response.state,
+            agent_ctx: ctx.agent_ctx,
+            dispatch_idempotency_key: ctx.dispatch_idempotency_key,
+            action_params: ctx.action_params,
+            mode: super::WasmDispatchMode::Inline,
+        };
+        let mut inline_response =
+            match super::wasm::dispatch_wasm_integrations_boxed(self, &wasm_req).await {
+                Ok(inline) => inline,
+                Err(err) => return failed(format!("WASM integration failed: {err}")),
+            };
+        let adapter_state = inline_response
+            .as_ref()
+            .map(|inline| &inline.state)
+            .unwrap_or(&response.state);
+        let adapter_req = super::WasmDispatchRequest {
+            tenant: ctx.tenant,
+            entity_type: ctx.entity_type,
+            entity_id: ctx.entity_id,
+            action: ctx.action,
+            custom_effects: &response.custom_effects,
+            entity_state: adapter_state,
+            agent_ctx: ctx.agent_ctx,
+            dispatch_idempotency_key: None,
+            action_params: ctx.action_params,
+            mode: super::WasmDispatchMode::Inline,
+        };
+        match Box::pin(self.dispatch_adapter_integrations_internal(&adapter_req)).await {
+            Ok(Some(adapter_response)) => inline_response = Some(adapter_response),
+            Ok(None) => {}
+            Err(err) => return failed(format!("adapter integration failed: {err}")),
+        }
+        inline_response.unwrap_or(response)
     }
 }
 

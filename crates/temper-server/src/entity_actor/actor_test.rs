@@ -2561,6 +2561,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         params: serde_json::json!({"Customer": "Alice"}),
         idempotency_key: None,
         idempotency_binding: None,
+        idempotency_result: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,
@@ -2632,4 +2633,480 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         counted,
         "a skipped field-update event must be counted, not only logged"
     );
+}
+
+/// nerdsane/temper#523 review regressions (ADR-0182 "Review corrections").
+///
+/// Exercised through real `ServerState` dispatch and post-dispatch effects:
+/// 1. a replayed idempotent response is not a newly committed transition;
+/// 2. a spec change must not re-derive an original response with new rules;
+/// 3. racing writers on independent server instances sharing a real
+///    PostgreSQL 16 journal recheck the key after concurrency catch-up.
+mod review_523_regressions {
+    use serde_json::{Value, json};
+    use temper_runtime::ActorSystem;
+    use temper_runtime::persistence::EventStore;
+    use temper_runtime::scheduler::install_deterministic_context;
+    use temper_runtime::tenant::TenantId;
+    use temper_store_sim::SimEventStore;
+
+    use crate::entity_actor::EntityResponse;
+    use crate::registry::SpecRegistry;
+    use crate::request_context::AgentContext;
+    use crate::state::{DispatchError, ServerState};
+    use crate::storage::StorageStack;
+
+    const CSDL_XML: &str = include_str!("../../../../test-fixtures/specs/model.csdl.xml");
+    const ENTITY: &str = "TimedTask";
+
+    fn spec(start_effect: &str) -> String {
+        format!(
+            r#"
+[automaton]
+name = "TimedTask"
+states = ["Idle", "Running", "Stopped", "TimedOut"]
+initial = "Idle"
+allow_indefinite_states = ["Idle", "Stopped", "TimedOut"]
+
+[[state]]
+name = "starts"
+type = "counter"
+initial = 0
+
+[[state]]
+name = "flagged"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Start"
+kind = "input"
+from = ["Idle"]
+to = "Running"
+effect = [{start_effect}]
+
+[[action]]
+name = "Touch"
+kind = "input"
+from = ["Idle", "Running"]
+to = "Running"
+params = ["Note"]
+effect = ["starts += 1"]
+
+[[action]]
+name = "Stop"
+kind = "input"
+from = ["Running"]
+to = "Stopped"
+
+[[action]]
+name = "TimeoutFail"
+kind = "internal"
+from = ["Running"]
+to = "TimedOut"
+
+[[state_timeout]]
+state = "Running"
+after_seconds = 60
+on_timeout = "TimeoutFail"
+"#
+        )
+    }
+
+    /// Original rules: `Start` increments by one and raises the flag.
+    fn spec_v1() -> String {
+        spec(r#""starts += 1", "flagged = true""#)
+    }
+    /// Supported spec update: same target status, counter effect changed.
+    fn spec_counter_drift() -> String {
+        spec(r#""starts += 2", "flagged = true""#)
+    }
+    /// Supported spec update: same target status, boolean effect changed.
+    fn spec_flag_drift() -> String {
+        spec(r#""starts += 1", "flagged = false""#)
+    }
+
+    fn registry(spec: &str) -> SpecRegistry {
+        let mut registry = SpecRegistry::new();
+        registry.register_tenant(
+            "default",
+            temper_spec::csdl::parse_csdl(CSDL_XML).expect("setup: CSDL parse"),
+            CSDL_XML.to_string(),
+            &[(ENTITY, spec)],
+        );
+        registry
+    }
+
+    fn sim_server(store: &SimEventStore, spec: &str, name: &str) -> ServerState {
+        let mut state = ServerState::from_registry(ActorSystem::new(name), registry(spec));
+        state.set_storage_stack(StorageStack::from_sim(store.clone(), None));
+        state
+    }
+
+    async fn create(state: &ServerState, id: &str) {
+        state
+            .get_or_create_tenant_entity(&TenantId::default(), ENTITY, id, json!({"Id": id}))
+            .await
+            .expect("setup: create entity");
+    }
+
+    async fn act(
+        state: &ServerState,
+        id: &str,
+        action: &str,
+        params: Value,
+        key: &str,
+    ) -> Result<EntityResponse, DispatchError> {
+        let agent = AgentContext {
+            idempotency_key: Some(key.to_string()),
+            ..AgentContext::default()
+        };
+        state
+            .dispatch_tenant_action_ext_typed(
+                &TenantId::default(),
+                ENTITY,
+                id,
+                action,
+                params,
+                crate::state::DispatchExtOptions {
+                    agent_ctx: &agent,
+                    await_integration: false,
+                    await_reactions: true,
+                },
+            )
+            .await
+    }
+
+    async fn current(state: &ServerState, id: &str) -> EntityResponse {
+        state
+            .get_tenant_entity_state(&TenantId::default(), ENTITY, id)
+            .await
+            .expect("setup: read current entity state")
+    }
+
+    /// The request-semantic part of a response (ADR-0182 "original logical response").
+    fn logical(response: &EntityResponse) -> Value {
+        json!({
+            "status": response.state.status,
+            "item_count": response.state.item_count,
+            "counters": response.state.counters,
+            "booleans": response.state.booleans,
+            "lists": response.state.lists,
+            "fields": response.state.fields,
+        })
+    }
+
+    fn pending_timers(state: &ServerState) -> Vec<(String, u64)> {
+        state.state_timeout_tracker.pending_snapshot()
+    }
+
+    /// Changes broadcast for `action` since the receiver subscribed.
+    fn broadcasts_for(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::events::EntityStateChange>,
+        action: &str,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(change) = rx.try_recv() {
+            if change.action == action {
+                seen.push(change.status);
+            }
+        }
+        seen
+    }
+
+    fn sim_pid(id: &str) -> String {
+        format!("default:{ENTITY}:{id}")
+    }
+
+    // ------------------------------------------------------------------
+    // Review 1: a replayed response must not act as a new commit.
+    // ------------------------------------------------------------------
+
+    async fn superseded_key_replay(cold: bool, seed: u64) {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let id = "superseded";
+        let first = sim_server(&store, &spec_v1(), "review-523-first");
+        create(&first, id).await;
+
+        let original = act(&first, id, "Start", json!({}), "k-start")
+            .await
+            .expect("setup: Start");
+        assert!(
+            original.success && original.state.status == "Running",
+            "setup: Start"
+        );
+        assert_eq!(
+            pending_timers(&first),
+            vec![(ENTITY.to_string(), 1)],
+            "setup: Start arms the Running timeout"
+        );
+        let stopped = act(&first, id, "Stop", json!({}), "k-stop")
+            .await
+            .expect("setup: Stop");
+        assert!(
+            stopped.success && stopped.state.status == "Stopped",
+            "setup: Stop"
+        );
+        let journal_before = store.dump_journal(&sim_pid(id)).len();
+
+        let server = if cold {
+            sim_server(&store, &spec_v1(), "review-523-restarted")
+        } else {
+            first
+        };
+        // Stop cancels by bumping the timer generation; the sleeping task stays
+        // counted until it wakes. A replay must not spawn another timer.
+        let timers_before = pending_timers(&server);
+        let mut changes = server.event_tx.subscribe();
+        let replay = act(&server, id, "Start", json!({}), "k-start")
+            .await
+            .expect("REVIEW-523-1: retry of the first key must not error");
+
+        assert!(
+            replay.success && logical(&replay) == logical(&original),
+            "REVIEW-523-1: retry must return the ORIGINAL response.\n original: {}\n got: {}",
+            logical(&original),
+            logical(&replay)
+        );
+        assert_eq!(
+            pending_timers(&server),
+            timers_before,
+            "REVIEW-523-1 (cold={cold}): replaying the historical Running response armed a \
+             timeout on a Stopped entity"
+        );
+        let stale = broadcasts_for(&mut changes, "Start");
+        assert!(
+            stale.is_empty(),
+            "REVIEW-523-1 (cold={cold}): replay broadcast a state_change as if newly committed: {stale:?}"
+        );
+        assert_eq!(
+            current(&server, id).await.state.status,
+            "Stopped",
+            "REVIEW-523-1: live state (read by cross-entity guards) must stay at the later commit"
+        );
+        assert_eq!(
+            store.dump_journal(&sim_pid(id)).len(),
+            journal_before,
+            "REVIEW-523-1: replay appended a journal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_523_1_cold_replay_of_superseded_key_runs_no_transition_effects() {
+        superseded_key_replay(true, 5231).await;
+    }
+
+    #[tokio::test]
+    async fn review_523_1_warm_replay_of_superseded_key_runs_no_transition_effects() {
+        superseded_key_replay(false, 5232).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Review 2: a spec update must not change an original response.
+    // ------------------------------------------------------------------
+
+    async fn spec_drift_replay(drifted_spec: String, seed: u64) {
+        let (_guard, _clock, _ids) = install_deterministic_context(seed);
+        let store = SimEventStore::no_faults(seed);
+        let id = "drift";
+        let before = sim_server(&store, &spec_v1(), "review-523-v1");
+        create(&before, id).await;
+        let original = act(&before, id, "Start", json!({}), "k-drift")
+            .await
+            .expect("setup: Start under v1");
+        assert!(original.success, "setup: Start under v1");
+        let journal_before = store.dump_journal(&sim_pid(id)).len();
+
+        // Supported update: deploy the changed spec and restart over the same journal.
+        let after = sim_server(&store, &drifted_spec, "review-523-v2");
+        let replay = act(&after, id, "Start", json!({}), "k-drift").await;
+        match &replay {
+            Ok(response) if response.success => assert_eq!(
+                logical(response),
+                logical(&original),
+                "REVIEW-523-2: a 200 replay after a spec update must return the ORIGINAL \
+                 result, not one re-derived with the new rules"
+            ),
+            Err(DispatchError::IdempotencyKeyUnverifiable(_)) => {}
+            other => panic!(
+                "REVIEW-523-2: expected the original response or 409 IdempotencyKeyUnverifiable, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            store.dump_journal(&sim_pid(id)).len(),
+            journal_before,
+            "REVIEW-523-2: replay re-executed the action under the new spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_523_2_counter_effect_change_does_not_alter_original_response() {
+        spec_drift_replay(spec_counter_drift(), 5233).await;
+    }
+
+    #[tokio::test]
+    async fn review_523_2_boolean_effect_change_does_not_alter_original_response() {
+        spec_drift_replay(spec_flag_drift(), 5234).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Review 3: racing writers on independent servers sharing PostgreSQL 16.
+    // ------------------------------------------------------------------
+
+    struct Pg {
+        url: String,
+        _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    }
+
+    async fn private_pg16() -> Pg {
+        use testcontainers::ImageExt;
+        use testcontainers::runners::AsyncRunner;
+        let container = testcontainers_modules::postgres::Postgres::default()
+            .with_tag("16")
+            .start()
+            .await
+            .expect("setup: start a private PostgreSQL 16 container (Docker required)");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("setup: container port");
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = sqlx::PgPool::connect(&url).await.expect("setup: connect");
+        let version: String = sqlx::query_scalar("show server_version")
+            .fetch_one(&pool)
+            .await
+            .expect("setup: server_version");
+        assert!(
+            version.starts_with("16"),
+            "setup: expected PostgreSQL 16, got {version}"
+        );
+        temper_store_postgres::migration::run_migrations(&pool)
+            .await
+            .expect("setup: migrations");
+        Pg {
+            url,
+            _container: container,
+        }
+    }
+
+    /// An independent server instance: its own pool, actor system and caches.
+    async fn pg_server(
+        pg: &Pg,
+        name: &str,
+    ) -> (ServerState, temper_store_postgres::PostgresEventStore) {
+        let pool = sqlx::PgPool::connect(&pg.url)
+            .await
+            .expect("setup: connect");
+        let store = temper_store_postgres::PostgresEventStore::new(pool);
+        let mut state = ServerState::from_registry(ActorSystem::new(name), registry(&spec_v1()));
+        state.set_storage_stack(StorageStack::from_postgres(store.clone()));
+        (state, store)
+    }
+
+    async fn events_with_key(
+        store: &temper_store_postgres::PostgresEventStore,
+        id: &str,
+        key: &str,
+    ) -> usize {
+        store
+            .read_events(&sim_pid(id), 0)
+            .await
+            .expect("setup: read journal")
+            .iter()
+            .filter(|env| env.payload.get("idempotency_key").and_then(Value::as_str) == Some(key))
+            .count()
+    }
+
+    /// Server A commits `Touch` with key K. Server B's actor was hydrated at the
+    /// same earlier sequence and has an independent cache, so its request with
+    /// the same key executes against stale state and loses the optimistic
+    /// append — deterministically forcing the ADR-0046 catch-up replay.
+    async fn racing_writers(loser_note: &str) -> Race {
+        let pg = private_pg16().await;
+        let (a, store) = pg_server(&pg, "review-523-server-a").await;
+        let (b, _) = pg_server(&pg, "review-523-server-b").await;
+        let id = "race";
+        create(&a, id).await;
+        let hydrated = current(&b, id).await;
+        assert_eq!(
+            hydrated.state.sequence_nr, 1,
+            "setup: server B hydrated at the shared start sequence"
+        );
+
+        let winner = act(&a, id, "Touch", json!({"Note": "a"}), "k-race")
+            .await
+            .expect("setup: winner Touch");
+        assert!(winner.success, "setup: winner Touch");
+        assert!(
+            pending_timers(&b).is_empty(),
+            "setup: server B has no timers before its request"
+        );
+        let mut changes = b.event_tx.subscribe();
+        let loser = act(&b, id, "Touch", json!({"Note": loser_note}), "k-race").await;
+        let stray = broadcasts_for(&mut changes, "Touch");
+        Race {
+            loser,
+            winner,
+            b,
+            store,
+            stray,
+            _pg: pg,
+        }
+    }
+
+    struct Race {
+        loser: Result<EntityResponse, DispatchError>,
+        winner: EntityResponse,
+        b: ServerState,
+        store: temper_store_postgres::PostgresEventStore,
+        stray: Vec<String>,
+        _pg: Pg,
+    }
+
+    /// No losing journal event, timer or broadcast (checked in that order).
+    async fn assert_loser_committed_nothing(race: &Race) {
+        assert_eq!(
+            events_with_key(&race.store, "race", "k-race").await,
+            1,
+            "REVIEW-523-3: exactly one journal event may carry the key"
+        );
+        assert!(
+            pending_timers(&race.b).is_empty(),
+            "REVIEW-523-3: losing request armed timers: {:?}",
+            pending_timers(&race.b)
+        );
+        assert!(
+            race.stray.is_empty(),
+            "REVIEW-523-3: the losing server broadcast a state_change: {:?}",
+            race.stray
+        );
+    }
+
+    #[tokio::test]
+    async fn review_523_3_racing_different_requests_one_wins_other_422() {
+        let race = racing_writers("b").await;
+        assert_loser_committed_nothing(&race).await;
+        assert!(
+            matches!(race.loser, Err(DispatchError::IdempotencyKeyMismatch(_))),
+            "REVIEW-523-3: losing different request must get IdempotencyKeyMismatch, got {:?}",
+            race.loser
+        );
+    }
+
+    #[tokio::test]
+    async fn review_523_3_racing_identical_requests_return_original_once() {
+        let race = racing_writers("a").await;
+        assert_loser_committed_nothing(&race).await;
+        let loser = race
+            .loser
+            .as_ref()
+            .expect("REVIEW-523-3: identical losing request must not error");
+        assert!(
+            loser.success && logical(loser) == logical(&race.winner),
+            "REVIEW-523-3: identical losing request must return the ORIGINAL response.\n original: {}\n got: {}",
+            logical(&race.winner),
+            logical(loser)
+        );
+    }
 }

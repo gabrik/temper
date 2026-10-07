@@ -367,7 +367,8 @@ impl crate::state::ServerState {
             let mut event = result
                 .event
                 .expect("successful process_action returns an event");
-            event.idempotency_key = Some(write.idempotency_key.clone());
+            let (key, action, params) = (&write.idempotency_key, &write.action, &write.params);
+            crate::idempotency::stamp_keyed_commit(&mut event, key, action, params, &stream.state);
             stream
                 .events
                 .push(composite_envelope(&persistence_id, &event, &stream.state)?);
@@ -517,6 +518,7 @@ impl crate::state::ServerState {
                 params: serde_json::json!({}),
                 idempotency_key: None,
                 idempotency_binding: None,
+                idempotency_result: None,
             };
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
@@ -854,6 +856,7 @@ impl crate::state::ServerState {
                 params: serde_json::json!({}),
                 idempotency_key: None,
                 idempotency_binding: None,
+                idempotency_result: None,
             };
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);
@@ -904,7 +907,8 @@ impl crate::state::ServerState {
         let mut event = result
             .event
             .expect("successful process_action returns an event");
-        event.idempotency_key = Some(write.idempotency_key.clone());
+        let (key, action, params) = (&write.idempotency_key, &write.action, &write.params);
+        crate::idempotency::stamp_keyed_commit(&mut event, key, action, params, &stream.state);
         stream.state.sequence_nr += 1;
         stream.state.push_event_bounded(event);
         pending_overflow_blobs.extend(result.overflow_blobs);

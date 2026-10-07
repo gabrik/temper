@@ -29,17 +29,20 @@ pub use types::{EntityEvent, EntityMsg, EntityResponse, EntityState};
 mod idempotency_replay {
     //! Durable verification of reused idempotency keys (ADR-0182).
     //!
-    //! When the shared idempotency cache is cold (restart, eviction) a key found in
-    //! `processed_idempotency_keys` is verified against the journal event that
-    //! carries it, and the original response is rebuilt by replaying the journal up
-    //! to that event. Keys that cannot be verified fail closed.
+    //! When the shared idempotency cache is cold (restart, eviction) or a racing
+    //! writer's event was caught up during an optimistic-concurrency retry, a key
+    //! found in `processed_idempotency_keys` is verified against the journal event
+    //! that carries it, and the original response is rebuilt and checked against
+    //! the event's immutable provenance. Keys that cannot be verified fail closed.
 
     use serde_json::Value;
     use temper_jit::table::TransitionTable;
 
     use super::actor::{EntityActor, ReplayPolicy, ReplayTarget};
     use super::types::{EntityEvent, EntityResponse, EntityState};
-    use crate::idempotency::unqualified_action;
+    use crate::idempotency::{
+        IDEMPOTENCY_KEY_MISMATCH, IDEMPOTENCY_KEY_UNVERIFIABLE, result_digest, unqualified_action,
+    };
 
     /// Outcome of resolving a key that already produced a durable event.
     pub(super) enum ProcessedKeyResolution {
@@ -47,16 +50,17 @@ mod idempotency_replay {
         Original(Box<EntityState>),
         /// The key was used for a different action or body.
         Mismatch,
-        /// The key is recorded but its original request cannot be verified.
+        /// The key is recorded but its original request or result cannot be
+        /// verified (missing event or provenance, or transition-rule drift).
         Unverifiable,
     }
 
     /// Does `event` (which carries the request's key) record this same request?
     ///
-    /// Bound events compare the stored binding. Legacy events (written before
-    /// ADR-0182) are verified by repeating the transform the actor applied when it
-    /// journaled them: `sanitize(normalize_ref(action, params))` must equal the
-    /// stored `params`, and the unqualified action name must match.
+    /// Bound events compare the stored binding. Events without a binding are
+    /// verified by repeating the transform the actor applied when it journaled
+    /// them: `sanitize(normalize_ref(action, params))` must equal the stored
+    /// `params`, and the unqualified action name must match.
     fn event_matches_request(
         event: &EntityEvent,
         state: &EntityState,
@@ -71,6 +75,38 @@ mod idempotency_replay {
         let normalized = super::effects::normalize_ref_action_params(state, action, params);
         let journaled = super::effects::sanitize_action_params(normalized.as_ref());
         event.action == action && event.params == *journaled
+    }
+
+    /// Classify a duplicate: a different request is a mismatch; the same
+    /// request is answered with `candidate` only if `candidate` still hashes to
+    /// the provenance recorded when the event was committed (ADR-0182, review
+    /// correction 2). Missing provenance (pre-ADR events) fails closed.
+    fn verdict(
+        event: &EntityEvent,
+        candidate: EntityState,
+        request_state: &EntityState,
+        action: &str,
+        params: &Value,
+        binding: &str,
+    ) -> ProcessedKeyResolution {
+        if !event_matches_request(event, request_state, action, params, binding) {
+            return ProcessedKeyResolution::Mismatch;
+        }
+        match event.idempotency_result.as_deref() {
+            Some(recorded) if recorded == result_digest(&candidate) => {
+                ProcessedKeyResolution::Original(Box::new(candidate))
+            }
+            _ => ProcessedKeyResolution::Unverifiable,
+        }
+    }
+
+    /// A request whose idempotency key already produced a durable event.
+    pub(super) struct DuplicateRequest<'a> {
+        pub(super) key: &'a str,
+        pub(super) action: &'a str,
+        pub(super) params: &'a Value,
+        pub(super) binding: &'a str,
+        pub(super) related: &'a temper_jit::table::RelatedMap,
     }
 
     /// Failed reply for a mismatched or unverifiable key. Appends nothing.
@@ -97,16 +133,12 @@ mod idempotency_replay {
             params: &Value,
             binding: &str,
         ) -> ProcessedKeyResolution {
-            // The latest event carries the key: the current state is the original
-            // response, no replay needed.
+            // The latest event carries the key: the current state is the
+            // candidate original response, no replay needed.
             if let Some(last) = state.events.back()
                 && last.idempotency_key.as_deref() == Some(key)
             {
-                return if event_matches_request(last, state, action, params, binding) {
-                    ProcessedKeyResolution::Original(Box::new(state.clone()))
-                } else {
-                    ProcessedKeyResolution::Mismatch
-                };
+                return verdict(last, state.clone(), state, action, params, binding);
             }
 
             let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -144,16 +176,63 @@ mod idempotency_replay {
                 return ProcessedKeyResolution::Unverifiable;
             }
 
-            match replayed.events.back() {
+            match replayed.events.back().cloned() {
                 Some(event) if event.idempotency_key.as_deref() == Some(key) => {
-                    if event_matches_request(event, state, action, params, binding) {
-                        ProcessedKeyResolution::Original(Box::new(replayed))
-                    } else {
-                        ProcessedKeyResolution::Mismatch
-                    }
+                    verdict(&event, replayed, state, action, params, binding)
                 }
                 _ => ProcessedKeyResolution::Unverifiable,
             }
+        }
+
+        /// Reply for a request whose key already produced a durable event.
+        ///
+        /// The original response is cached as a historical replay so dispatch
+        /// never treats it as a newly committed transition (ADR-0182, review
+        /// correction 1). Mismatched or unverifiable keys append nothing.
+        pub(super) async fn idempotent_duplicate_reply(
+            &self,
+            table: &TransitionTable,
+            state: &EntityState,
+            request: DuplicateRequest<'_>,
+        ) -> EntityResponse {
+            let DuplicateRequest {
+                key,
+                action,
+                params,
+                binding,
+                related,
+            } = request;
+            let original = match self
+                .resolve_processed_idempotency_key(table, state, key, action, params, binding)
+                .await
+            {
+                ProcessedKeyResolution::Original(original) => original,
+                ProcessedKeyResolution::Mismatch => {
+                    return idempotency_rejection(state, IDEMPOTENCY_KEY_MISMATCH);
+                }
+                ProcessedKeyResolution::Unverifiable => {
+                    return idempotency_rejection(state, IDEMPOTENCY_KEY_UNVERIFIABLE);
+                }
+            };
+            let custom_effects =
+                super::actor::duplicate_idempotency_custom_effects(table, state, action, related);
+            let mut response_state = *original;
+            if !custom_effects.is_empty() {
+                super::effects::prune_transient_action_fields_from_state(&mut response_state);
+            }
+            let response = EntityResponse {
+                success: true,
+                state: response_state,
+                error: None,
+                custom_effects,
+                scheduled_actions: vec![],
+                spawn_requests: vec![],
+                spec_governed: true,
+            };
+            if let Some(cache) = self.idempotency_cache.as_ref() {
+                cache.put_historical(&self.persistence_id(), key, binding, response.clone());
+            }
+            response
         }
     }
 }

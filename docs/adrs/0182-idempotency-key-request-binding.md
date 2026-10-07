@@ -134,9 +134,14 @@ differences that are not request semantics are allowed:
   *same* entity (inherited trigger and callback keys) now get an explicit
   422 where they were previously swallowed. The full suite is green. Any
   such flow found later should get a distinct key, not a weaker check.
-- Post-dispatch effects still run for a successful duplicate, as before.
-  Query projection is sequence-guarded, so a replayed historical state
-  cannot overwrite a newer projection row.
+- A successful duplicate runs post-dispatch effects only when its dispatcher
+  claims a fresh commit whose effects never ran (dropped reply or failed
+  effects). Every other duplicate is a replay without transition effects
+  (review correction 1).
+- Cold retries of keys committed before this ADR carry no result provenance.
+  They fail closed with 409 instead of returning a possibly re-derived 200
+  (review correction 2). A mismatched request is still 422.
+- The binding and the result digest add 128 hex characters per keyed event.
 
 ### DST Compliance
 - Hashing is pure. Canonicalization sorts keys explicitly, independent of
@@ -149,7 +154,9 @@ differences that are not request semantics are allowed:
   durable keys (#519 V7).
 - `--actor-runtime postgres` actor-backed types, which do not use
   idempotency keys (HTTP 202 enqueue).
-- Re-running post-dispatch effects for concurrent duplicates.
+- Returning the original value after transition-rule drift. Without stored
+  per-event state the server cannot recompute it, so drift fails closed
+  with 409.
 
 ## Alternatives Considered
 
@@ -167,6 +174,200 @@ differences that are not request semantics are allowed:
 Reverting the code is safe: older builds ignore the extra
 `idempotency_binding` payload field (`serde(default)`) and fall back to
 key-only dedup.
+
+## Review corrections (nerdsane/temper#523)
+
+The PR review raised three findings. Each is reproduced by a new failing
+regression test (`entity_actor/actor_test.rs`, module
+`review_523_regressions`) before any production change. The original four
+frozen `factory_regression` files are not touched.
+
+### Correction 1: a replayed response is not a newly committed transition
+
+Finding r4203860027: a cold retry sent the historical state through
+`run_post_dispatch_effects`. That cancelled or armed state timeouts,
+broadcast a stale `state_change` and enqueued projection writes.
+
+Decision: each idempotency cache entry records who owns the post-dispatch
+effects of the commit behind it:
+
+| State | Meaning |
+|---|---|
+| `Pending` | Written by the actor for a fresh commit. Effects have not been claimed. |
+| `Claimed` | One dispatcher owns the effects. |
+| `Applied` | The effects completed. |
+| `Historical` | A response rebuilt from the journal or the latest in-memory event, not a new commit. |
+
+`dispatch_tenant_action_core` calls
+`IdempotencyCache::claim_post_dispatch_effects`. Only the claimant runs the
+full pipeline, and it marks the entry `Applied` on success or releases it
+back to `Pending` on failure. This keeps the existing recovery: a retry
+after a dropped actor reply or a failed integration still runs the effects
+exactly once.
+
+Every other reply is a replay. It returns the original response and runs
+no transition effects: no state timers, no broadcast, no projection, no
+webhooks, no spawns, no scheduled actions. One exception keeps intended
+behaviour: a `Historical` composite duplicate still re-runs its re-emitted
+trigger integrations, which are idempotent by design. The ownership state
+is explicit; no unrelated response flag is reused.
+
+### Correction 2: immutable execution provenance
+
+Finding r4203860035: replaying the journal with the *current* transition
+table made a spec change (for example `+= 1` to `+= 2`) return a different
+value with 200.
+
+Decision: every keyed event also stores `idempotency_result`, a SHA-256 over
+the post-commit logical state (`status`, `item_count`, `counters`,
+`booleans`, `lists`, `fields`). This is 64 hex characters per event, not a
+snapshot and not a response history.
+
+A duplicate returns 200 only if the state rebuilt for it (the latest live
+state, or the journal replayed up to the key's event) hashes to the stored
+value. If the table drifted, the reply is 409 `IdempotencyKeyUnverifiable`.
+Events written before this ADR have no provenance and also fail closed with
+409 when the request matches. A mismatched request is still 422 because the
+binding check runs first. The temper server never returns a 200 computed
+under different rules.
+
+### Correction 3: racing writers recheck the key after catch-up
+
+Finding r4203860041: two server instances with independent caches
+received the same key. The losing actor hit an optimistic-concurrency
+conflict, replayed the winner's event, then re-ran its own request. That
+appended a second event with the same key.
+
+Decision: in the ADR-0046 retry loop, immediately after catch-up replay,
+the actor re-checks `processed_idempotency_keys`. If the key is now
+present, it resolves it exactly like the durable duplicate path:
+
+- same logical request: the original response, as a `Historical` replay
+- different request: 422
+- unverifiable: 409
+
+The losing request is never re-executed.
+
+### Scope
+
+All changes stay inside the existing 20-file footprint:
+
+- `idempotency.rs`: ownership states
+- `entity_actor/{mod.rs,actor.rs,types.rs}`: provenance and the retry recheck
+- `state/dispatch/actions.rs`: claim gating
+- `state/dispatch/composite.rs`: provenance on atomic sub-write events
+- the regression tests
+
+`state/dispatch/effects.rs` is not edited. The integrations-only replay
+path in `actions.rs` mirrors step 5 of `run_post_dispatch_effects`.
+
+### Correction evidence
+
+Pre-fix production code: `23a207b9296e96c7deb0efd116873cf13cfab604`. At that
+point the only working-tree changes were the new tests and this plan.
+
+The four original frozen `factory_regression` files are byte-identical to
+`refs/factory/regression-tests` (`4bba5d9`); `git diff --stat` against that
+ref prints nothing.
+
+The new tests live in `entity_actor/actor_test.rs`, module
+`review_523_regressions`. They run through real `ServerState` dispatch and
+post-dispatch effects. Review 3 uses two independent server instances, each
+with its own pool, actor system and caches, sharing a private
+**PostgreSQL 16** testcontainer.
+
+```bash
+cargo test -p temper-server --lib review_523 -- --test-threads=1            # red, then green
+cargo test --locked -p temper-server --release --lib review_523 -- --test-threads=1
+```
+
+**Red on the pre-fix code: 0 passed, 6 failed.** Each failure is the
+reviewed defect:
+
+```text
+review_523_1_cold_replay_of_superseded_key_runs_no_transition_effects  FAILED
+  REVIEW-523-1 (cold=true): replaying the historical Running response armed a timeout on a Stopped entity
+  left: [("TimedTask", 1)]   (right: [])
+review_523_1_warm_replay_of_superseded_key_runs_no_transition_effects  FAILED
+  REVIEW-523-1 (cold=false): ... left: [("TimedTask", 2)]   (right: [("TimedTask", 1)])
+review_523_2_counter_effect_change_does_not_alter_original_response    FAILED
+  REVIEW-523-2: a 200 replay after a spec update must return the ORIGINAL result ...  "starts": 2 (original 1)
+review_523_2_boolean_effect_change_does_not_alter_original_response    FAILED
+  REVIEW-523-2: ... "flagged": false (original true)
+review_523_3_racing_different_requests_one_wins_other_422             FAILED
+  REVIEW-523-3: exactly one journal event may carry the key   left: 2  right: 1
+review_523_3_racing_identical_requests_return_original_once            FAILED
+  REVIEW-523-3: exactly one journal event may carry the key   left: 2  right: 1
+```
+
+Two setup assumptions were corrected before the red pass was recorded. A
+cancelled state timer stays counted until its sleeping task wakes, so the
+test compares the timer count before and after the retry. The race test
+checks the journal before checking the broadcast. Neither change loosened
+what the tests detect.
+
+**Green after the fix: 6/6 in debug and release.** In both drift cases the
+replay fails closed with 409 `IdempotencyKeyUnverifiable`; the server never
+returns a re-derived 200.
+
+The original frozen suite still passes 20/20 in debug and release:
+`cargo test --locked -p temper-server --features observe [--release] --test factory_regression`.
+
+| Validation (after the fix) | Result |
+|---|---|
+| `cargo test --locked -p temper-server --lib idempotency::` | 11 passed (adds claim and historical-replay unit tests) |
+| `cargo test --locked -p temper-server --lib entity_actor::` | 108 passed |
+| `cargo test --locked -p temper-server --lib state::dispatch::` | 130 passed |
+| `cargo test --locked -p temper-server --lib odata::` | 106 passed |
+| `cargo test --locked -p temper-server --test dispatch_retry_idempotency` | 1 passed (dropped-reply effect recovery preserved) |
+| DST core / platform-boot / platform-consistency / platform-random smoke | 26 / 9 / 13 / 7 passed |
+| `cargo fmt --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` | ok |
+| `cargo nextest run --workspace --no-fail-fast -E 'not test(dst_)'` (historical migration fixtures present) | **3557 passed, 0 failed**, 65 skipped |
+| observe-gated `spec_validate_endpoint` / `observe::` / `api::repl::`, `cargo test --doc --workspace` | 2 / 92 / 2 passed, doctests ok |
+| readability ratchet, storage dispatch boundary | ok (GT1000 24/24, ALLOW_CLIPPY 36/36) |
+
+**Real HTTP, PostgreSQL 16 behind Toxiproxy.** The Appendix B driver passed
+49/49 checks in both debug and release; the earlier phases are unchanged.
+The new phases:
+
+```text
+== review 3: two `temper serve` instances on the same private database
+B-hydrate-1                 200
+A-K6-winner                 200
+B-K6-different-body         422 IdempotencyKeyMismatch   K6 events: 1
+B-hydrate-2                 200
+A-K7-winner                 200
+B-K7-identical              200 == original response    K7 events: 1
+instance B log: "persist hit optimistic-concurrency violation; entering ADR-0046 retry" actual_seq=7 (K7)
+== review 1: cold retry of a superseded key
+K8-cancel                   200 Cancelled
+(restart)
+cold-K1-after-cancel        200 == original Draft response
+GET status                  Cancelled
+catalog row                 Cancelled
+journal                     no new event
+== review 2: restart under a spec copy with AddItem `items += 2`
+drift-K2-retry              409 IdempotencyKeyUnverifiable
+journal                     no new event
+drift spec live             6 AddItem events replay to 12 items
+```
+
+K6 was rejected by the durable-path check: instance B's actor had already
+caught up while waiting out the verification gate. K7 went through the
+ADR-0046 catch-up re-check. The deterministic unit test pins that path
+regardless.
+
+**Limitations:**
+
+- PostgreSQL has no query-plane projection store (that lives in Turso), so
+  "no losing projection update" on PostgreSQL is shown by the journal plus
+  the absence of a broadcast or timer. The catalog is checked over HTTP.
+- In the unit tests the review-1 timer observable is the spawned timer
+  count; cancellation is generation-based.
+- Keys committed before this ADR fail closed with 409 on a matching cold
+  retry (no provenance).
+- The spec-drift case fails closed with 409 and does not return the
+  original value.
 
 ## PR packaging note
 
@@ -378,7 +579,10 @@ After the move:
 
 ## Appendix B: End-to-end driver (`e2e.py`)
 
-Save as `e2e.py` and run it as shown in Appendix A.
+Save as `e2e.py` and run it as shown in Appendix A. Set `FX_SPECS` to the
+private spec copy with the proof-only policy. Set `FX_SPECS_DRIFT` to the
+same copy with `AddItem` changed to `effect = ["items += 2"]`, which the
+review-2 phase uses.
 
 ```python
 #!/usr/bin/env python3
@@ -411,6 +615,7 @@ TENANT = "ecommerce"
 ISSUER = "e2e-issuer"
 AUDIENCE = "temper"
 SPECS = os.environ.get("FX_SPECS", "/tmp/fx519/ecommerce-specs")  # private copy + proof-only Cedar policy
+SPECS_DRIFT = os.environ.get("FX_SPECS_DRIFT", "/tmp/fx519/ecommerce-specs-drift")  # AddItem: items += 2
 API_KEY = secrets.token_hex(24)
 ORDER = f"e2e-{PROFILE}-order"
 os.makedirs(OUT, exist_ok=True)
@@ -495,7 +700,7 @@ def check(cond, msg):
         failures.append(msg)
 
 
-def call(label, method, path, body=None, key=None, token=TOKEN, headers=None, timeout=60):
+def call(label, method, path, body=None, key=None, token=TOKEN, headers=None, timeout=60, base=None):
     hdrs = {"Content-Type": "application/json", "X-Tenant-Id": TENANT}
     if token is not None:
         hdrs["Authorization"] = f"Bearer {token}"
@@ -503,7 +708,7 @@ def call(label, method, path, body=None, key=None, token=TOKEN, headers=None, ti
         hdrs["Idempotency-Key"] = key
     hdrs.update(headers or {})
     data = body.encode() if isinstance(body, str) else None
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers=hdrs)
+    req = urllib.request.Request((base or BASE) + path, data=data, method=method, headers=hdrs)
     started = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -545,36 +750,59 @@ server = None
 server_runs = 0
 
 
-def start_server():
-    global server, server_runs
+def start_instance(name, port, specs):
+    """Boot one `temper serve` instance on the shared private database."""
+    global server_runs
     server_runs += 1
-    env = dict(os.environ, HOME=f"{OUT}/home", TEMPER_API_KEY=API_KEY,
+    env = dict(os.environ, HOME=f"{OUT}/home-{name}", TEMPER_API_KEY=API_KEY,
                TEMPER_TRUSTED_ISSUER_URL=ISSUER, TEMPER_TRUSTED_ISSUER_JWKS=JWKS,
                TEMPER_TRUSTED_ISSUER_AUD=AUDIENCE,
                DATABASE_URL=f"postgresql://postgres:fx@{PG_PROXY}/{DB}", RUST_LOG="warn")
-    log = open(f"{OUT}/server-{server_runs}.log", "w")
-    server = subprocess.Popen(
-        [BIN, "serve", "--storage", "postgres", "--app",
-         f"{TENANT}={SPECS}", "--port", str(PORT), "--no-observe"],
+    log_path = f"{OUT}/server-{server_runs}-{name}.log"
+    log = open(log_path, "w")
+    proc = subprocess.Popen(
+        [BIN, "serve", "--storage", "postgres", "--app", f"{TENANT}={specs}",
+         "--port", str(port), "--no-observe"],
         env=env, stdout=log, stderr=subprocess.STDOUT, cwd="/work/repo")
+    base = f"http://127.0.0.1:{port}"
     for _ in range(300):
         try:
-            if urllib.request.urlopen(BASE + "/healthz", timeout=2).status == 200:
-                return
+            if urllib.request.urlopen(base + "/healthz", timeout=2).status == 200:
+                return proc, base, log_path
         except Exception:
             pass
-        if server.poll() is not None:
-            raise SystemExit(f"setup: server exited early, see {OUT}/server-{server_runs}.log")
+        if proc.poll() is not None:
+            raise SystemExit(f"setup: server exited early, see {log_path}")
         time.sleep(1)
     raise SystemExit("setup: server did not become healthy")
 
 
-def stop_server():
-    server.terminate()
+def start_server(specs=None):
+    global server
+    server, _, _ = start_instance("a", PORT, specs or SPECS)
+
+
+def stop_proc(proc):
+    proc.terminate()
     try:
-        server.wait(timeout=30)
+        proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
-        server.kill()
+        proc.kill()
+
+
+def until_verified(label, method, path, body=None, key=None, base=None, headers=None):
+    """Retry while the gate answers 423 (background spec verification); 423 writes nothing."""
+    for _ in range(240):
+        s, b = call(label, method, path, body, key=key, base=base, headers=headers)
+        if s != 423:
+            return s, b
+        history.pop()
+        time.sleep(1)
+    return s, b
+
+
+def stop_server():
+    stop_proc(server)
 
 
 def journal():
@@ -722,6 +950,71 @@ def main():
     check(row is not None and row.get("status") == status_fold, "catalog row status == fold")
     check(k1_fold == (original.get("status"), original.get("counters", {}).get("items")),
           f"prefix fold through K1 {k1_fold} == original K1 response")
+
+    # ---------------- PR #523 review corrections ----------------
+    print("== review 3: racing writers on two server instances sharing PostgreSQL", flush=True)
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port_b = sock.getsockname()[1]
+    proc_b, base_b, log_b = start_instance("b", port_b, SPECS)
+    s, _ = until_verified("B-hydrate-1", "GET", f"/tdata/Orders('{ORDER}')", base=base_b)
+    check(s == 200, f"instance B hydrated the order (got {s})")
+    s, w6 = call("A-K6-winner", "POST", ADD, '{"ProductId":"p-6","Quantity":1}', key="K6")
+    check(s == 200, f"instance A commits K6 (got {s})")
+    s, b = until_verified("B-K6-different-body", "POST", ADD, '{"ProductId":"p-6b","Quantity":1}',
+                          key="K6", base=base_b)
+    check(s == 422 and error_code(b) == "IdempotencyKeyMismatch",
+          f"instance B racing with a different body -> 422 (got {s} {error_code(b)})")
+    check(len(key_events(journal(), "K6")) == 1, "K6 has exactly one journal event across instances")
+    s, _ = call("B-hydrate-2", "GET", f"/tdata/Orders('{ORDER}')", base=base_b)
+    s, w7 = call("A-K7-winner", "POST", ADD, '{"ProductId":"p-7","Quantity":1}', key="K7")
+    check(s == 200, f"instance A commits K7 (got {s})")
+    s, b = call("B-K7-identical", "POST", ADD, '{"ProductId":"p-7","Quantity":1}', key="K7",
+                base=base_b)
+    check(s == 200 and logical(b) == logical(w7),
+          f"instance B racing with the identical request returns the ORIGINAL response (status {s})")
+    check(len(key_events(journal(), "K7")) == 1, "K7 has exactly one journal event across instances")
+    stop_proc(proc_b)
+    raced = open(log_b).read().count("optimistic-concurrency violation")
+    check(raced >= 1, f"instance B entered the ADR-0046 concurrency retry ({raced} time(s))")
+
+    print("== review 1: cold retry of a superseded key after cancellation", flush=True)
+    s, b = call("K8-cancel", "POST", CANCEL, '{"Reason":"customer request"}', key="K8")
+    check(s == 200 and b.get("status") == "Cancelled", f"K8 CancelOrder commits (got {s})")
+    before_review1 = len(journal())
+    stop_server()
+    start_server()
+    s, b = until_verified("cold-K1-after-cancel", "POST", ADD_SHORT, EQUIVALENT, key="K1",
+                          headers=TRANSPORT)
+    check(s == 200 and logical(b) == logical(original),
+          f"cold K1 retry after cancellation returns the ORIGINAL Draft response (status {s})")
+    s, live = call("get-after-superseded-retry", "GET", f"/tdata/Orders('{ORDER}')")
+    check(live.get("status") == "Cancelled", f"live status stays Cancelled (got {live.get('status')})")
+    s, cat = call("catalog-after-superseded-retry", "GET", "/tdata/Orders")
+    row = next((r for r in (cat or {}).get("value", [])
+                if r.get("entity_id") == ORDER or r.get("Id") == ORDER), None)
+    check(row is not None and row.get("status") == "Cancelled", "catalog row stays Cancelled")
+    check(len(journal()) == before_review1, "superseded-key retry appended no event")
+
+    print("== review 2: supported spec update (AddItem items += 2) then cold retry", flush=True)
+    stop_server()
+    start_server(SPECS_DRIFT)
+    before_review2 = len(journal())
+    s, b = until_verified("drift-K2-retry", "POST", ADD, SECOND, key="K2")
+    original_k2 = next(e["body"] for e in history if e["label"] == "K2-intervening")
+    ok_original = s == 200 and logical(b) == logical(original_k2)
+    ok_closed = s == 409 and error_code(b) == "IdempotencyKeyUnverifiable"
+    check(ok_original or ok_closed,
+          f"after the spec update K2 returns the original result or 409 Unverifiable, never a "
+          f"re-derived 200 (got {s} {error_code(b)})")
+    check(len(journal()) == before_review2, "spec-drift retry appended no event")
+    s, live = call("get-under-drift-spec", "GET", f"/tdata/Orders('{ORDER}')")
+    adds = len([e for e in journal() if e["payload"].get("action") == "AddItem"])
+    check(live.get("counters", {}).get("items") == 2 * adds,
+          f"drift spec is live: {adds} AddItem events replay to {2 * adds} items "
+          f"(got {live.get('counters', {}).get('items')})")
+    events = journal()
     stop_server()
 
     with open(f"{OUT}/history.json", "w") as f:

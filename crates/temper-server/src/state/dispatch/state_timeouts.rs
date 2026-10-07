@@ -527,6 +527,7 @@ mod tests {
             params: serde_json::json!({}),
             idempotency_key: None,
             idempotency_binding: None,
+            idempotency_result: None,
         }
     }
 

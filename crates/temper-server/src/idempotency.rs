@@ -35,58 +35,102 @@ const REQUEST_BINDING_TAG: &[u8] = b"temper.idempotency.v1";
 /// hashed with sorted keys, arrays keep their order, and nested keys of any name
 /// are part of the binding. Transport metadata is never an input.
 pub fn request_binding(action: &str, params: &serde_json::Value) -> String {
-    fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) {
-        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        hasher.update(len.to_be_bytes());
-        hasher.update(bytes);
-    }
-
-    fn update_json(hasher: &mut Sha256, value: &serde_json::Value, top_level: bool) {
-        match value {
-            serde_json::Value::Null => hasher.update([0]),
-            serde_json::Value::Bool(value) => hasher.update([1, u8::from(*value)]),
-            serde_json::Value::Number(value) => {
-                hasher.update([2]);
-                update_bytes(hasher, value.to_string().as_bytes());
-            }
-            serde_json::Value::String(value) => {
-                hasher.update([3]);
-                update_bytes(hasher, value.as_bytes());
-            }
-            serde_json::Value::Array(values) => {
-                hasher.update([4]);
-                hasher.update((values.len() as u64).to_be_bytes());
-                for value in values {
-                    update_json(hasher, value, false);
-                }
-            }
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map
-                    .keys()
-                    .filter(|key| {
-                        !(top_level && temper_spec::automaton::is_server_derived_field_name(key))
-                    })
-                    .collect();
-                keys.sort();
-                hasher.update([5]);
-                hasher.update((keys.len() as u64).to_be_bytes());
-                for key in keys {
-                    update_bytes(hasher, key.as_bytes());
-                    update_json(hasher, &map[key.as_str()], false);
-                }
-            }
-        }
-    }
-
     let mut hasher = Sha256::new();
     update_bytes(&mut hasher, REQUEST_BINDING_TAG);
     update_bytes(&mut hasher, unqualified_action(action).as_bytes());
     update_json(&mut hasher, params, true);
+    hex_digest(hasher)
+}
+
+const RESULT_DIGEST_TAG: &[u8] = b"temper.idempotency.result.v1";
+
+/// Immutable execution provenance of a keyed commit (ADR-0182, review
+/// correction 2): SHA-256 over the post-commit logical state — `status`,
+/// `item_count`, `counters`, `booleans`, `lists` and `fields`. Bookkeeping
+/// (event history, sequence numbers, snapshot counters, processed keys) is
+/// excluded, so a live commit and a faithful replay of it hash equal, while a
+/// replay under changed transition rules does not.
+pub fn result_digest(state: &crate::entity_actor::EntityState) -> String {
+    let logical = serde_json::json!({
+        "status": state.status,
+        "item_count": state.item_count,
+        "counters": state.counters,
+        "booleans": state.booleans,
+        "lists": state.lists,
+        "fields": state.fields,
+    });
+    let mut hasher = Sha256::new();
+    update_bytes(&mut hasher, RESULT_DIGEST_TAG);
+    update_json(&mut hasher, &logical, false);
+    hex_digest(hasher)
+}
+
+/// Stamp an event committed under idempotency `key` with its request binding
+/// and immutable result provenance (ADR-0182). `state` is the post-commit state.
+pub fn stamp_keyed_commit(
+    event: &mut crate::entity_actor::EntityEvent,
+    key: &str,
+    action: &str,
+    params: &serde_json::Value,
+    state: &crate::entity_actor::EntityState,
+) {
+    event.idempotency_key = Some(key.to_string());
+    event.idempotency_binding = Some(request_binding(action, params));
+    event.idempotency_result = Some(result_digest(state));
+}
+
+fn hex_digest(hasher: Sha256) -> String {
     hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Canonical JSON: sorted object keys, ordered arrays, type-tagged and
+/// length-prefixed scalars. `top_level` drops server-derived keys of the
+/// outermost object only.
+fn update_json(hasher: &mut Sha256, value: &serde_json::Value, top_level: bool) {
+    match value {
+        serde_json::Value::Null => hasher.update([0]),
+        serde_json::Value::Bool(value) => hasher.update([1, u8::from(*value)]),
+        serde_json::Value::Number(value) => {
+            hasher.update([2]);
+            update_bytes(hasher, value.to_string().as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            hasher.update([3]);
+            update_bytes(hasher, value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            hasher.update([4]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                update_json(hasher, value, false);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map
+                .keys()
+                .filter(|key| {
+                    !(top_level && temper_spec::automaton::is_server_derived_field_name(key))
+                })
+                .collect();
+            keys.sort();
+            hasher.update([5]);
+            hasher.update((keys.len() as u64).to_be_bytes());
+            for key in keys {
+                update_bytes(hasher, key.as_bytes());
+                update_json(hasher, &map[key.as_str()], false);
+            }
+        }
+    }
 }
 
 /// Strip an OData namespace qualifier (`Temper.Example.AddItem` → `AddItem`).
@@ -119,9 +163,36 @@ struct IdempotencyEntry {
     binding: String,
     /// When this entry was created (for TTL eviction).
     created_at: chrono::DateTime<chrono::Utc>,
-    /// Whether dispatcher-side post-dispatch effects have completed for this
-    /// cached response.
-    effects_applied: bool,
+    /// Who owns the post-dispatch effects of the commit behind this entry.
+    effects: EffectsState,
+}
+
+/// Ownership of a cached commit's post-dispatch effects (ADR-0182, review
+/// correction 1). Only a fresh commit's effects may ever run, exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectsState {
+    /// Fresh actor commit; no dispatcher has claimed its effects yet.
+    Pending,
+    /// A dispatcher is running the effects.
+    Claimed,
+    /// The effects completed.
+    Applied,
+    /// A response rebuilt from the journal or the latest in-memory event. It
+    /// is a replay, not a newly committed transition.
+    Historical,
+}
+
+/// Outcome of [`IdempotencyCache::claim_post_dispatch_effects`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectsClaim {
+    /// This dispatcher owns the commit's post-dispatch effects and must run
+    /// them, then call `mark_effects_applied` or `release_effects_claim`.
+    Owner,
+    /// Another dispatcher owns (or already ran) the effects: replay only.
+    Replay,
+    /// A response rebuilt from history: replay only; its re-emitted composite
+    /// triggers may be re-run because they are idempotent by design.
+    HistoricalReplay,
 }
 
 /// Per-entity-actor idempotency cache.
@@ -187,7 +258,7 @@ impl IdempotencyCache {
         if entry.binding != binding {
             return IdempotencyLookup::Mismatch;
         }
-        if require_effects_applied && !entry.effects_applied {
+        if require_effects_applied && entry.effects != EffectsState::Applied {
             return IdempotencyLookup::Miss;
         }
         IdempotencyLookup::Hit(Box::new(entry.response.clone()))
@@ -197,7 +268,32 @@ impl IdempotencyCache {
     ///
     /// If the per-actor budget is exceeded, the oldest entry is evicted.
     pub fn put(&self, actor_key: &str, idem_key: &str, binding: &str, response: EntityResponse) {
-        self.put_with_effects_applied(actor_key, idem_key, binding, response, false);
+        self.insert(
+            actor_key,
+            idem_key,
+            binding,
+            response,
+            EffectsState::Pending,
+        );
+    }
+
+    /// Cache a response rebuilt from history (journal replay or the latest
+    /// in-memory event). It is not a new commit, so no dispatcher may run its
+    /// transition effects.
+    pub fn put_historical(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        binding: &str,
+        response: EntityResponse,
+    ) {
+        self.insert(
+            actor_key,
+            idem_key,
+            binding,
+            response,
+            EffectsState::Historical,
+        );
     }
 
     /// Cache a response whose post-dispatch effects are known to be complete.
@@ -208,7 +304,50 @@ impl IdempotencyCache {
         binding: &str,
         response: EntityResponse,
     ) {
-        self.put_with_effects_applied(actor_key, idem_key, binding, response, true);
+        self.insert(
+            actor_key,
+            idem_key,
+            binding,
+            response,
+            EffectsState::Applied,
+        );
+    }
+
+    /// Claim the post-dispatch effects of the commit cached under `idem_key`.
+    ///
+    /// Exactly one dispatcher becomes [`EffectsClaim::Owner`] of a fresh
+    /// commit. Every other reply for the key is a replay. Without an entry
+    /// (an actor without a cache, or an evicted entry) the caller owns the
+    /// effects, as before this cache existed.
+    pub fn claim_post_dispatch_effects(&self, actor_key: &str, idem_key: &str) -> EffectsClaim {
+        let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
+        let Some(entry) = entries
+            .get_mut(actor_key)
+            .and_then(|actor_entries| actor_entries.get_mut(idem_key))
+        else {
+            return EffectsClaim::Owner;
+        };
+        match entry.effects {
+            EffectsState::Pending => {
+                entry.effects = EffectsState::Claimed;
+                EffectsClaim::Owner
+            }
+            EffectsState::Claimed | EffectsState::Applied => EffectsClaim::Replay,
+            EffectsState::Historical => EffectsClaim::HistoricalReplay,
+        }
+    }
+
+    /// Return a claim after the owner's effects failed, so a retry can run
+    /// them (recovery of genuinely pending effects).
+    pub fn release_effects_claim(&self, actor_key: &str, idem_key: &str) {
+        let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
+        if let Some(entry) = entries
+            .get_mut(actor_key)
+            .and_then(|actor_entries| actor_entries.get_mut(idem_key))
+            && entry.effects == EffectsState::Claimed
+        {
+            entry.effects = EffectsState::Pending;
+        }
     }
 
     /// Mark a cached response as having completed post-dispatch effects.
@@ -230,17 +369,19 @@ impl IdempotencyCache {
             return false;
         }
 
-        entry.effects_applied = true;
+        if entry.effects != EffectsState::Historical {
+            entry.effects = EffectsState::Applied;
+        }
         true
     }
 
-    fn put_with_effects_applied(
+    fn insert(
         &self,
         actor_key: &str,
         idem_key: &str,
         binding: &str,
         response: EntityResponse,
-        effects_applied: bool,
+        effects: EffectsState,
     ) {
         let now = sim_now();
         let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
@@ -271,7 +412,7 @@ impl IdempotencyCache {
                 response,
                 binding: binding.to_string(),
                 created_at: now,
-                effects_applied,
+                effects,
             },
         );
     }
@@ -436,5 +577,48 @@ mod tests {
         ] {
             assert_ne!(reference, request_binding("AddItem", &other), "{other}");
         }
+    }
+
+    #[test]
+    fn exactly_one_dispatcher_owns_fresh_commit_effects() {
+        let cache = IdempotencyCache::new();
+        cache.put("Order:o1", "key-1", B, make_response("Active"));
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o1", "key-1"),
+            EffectsClaim::Owner
+        );
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o1", "key-1"),
+            EffectsClaim::Replay
+        );
+        cache.release_effects_claim("Order:o1", "key-1");
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o1", "key-1"),
+            EffectsClaim::Owner,
+            "failed effects are released so a retry recovers them"
+        );
+        assert!(cache.mark_effects_applied("Order:o1", "key-1"));
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o1", "key-1"),
+            EffectsClaim::Replay
+        );
+    }
+
+    #[test]
+    fn historical_replays_never_own_transition_effects() {
+        let cache = IdempotencyCache::new();
+        cache.put_historical("Order:o1", "key-1", B, make_response("Active"));
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o1", "key-1"),
+            EffectsClaim::HistoricalReplay
+        );
+        assert!(matches!(
+            cache.lookup_after_effects_applied("Order:o1", "key-1", B),
+            IdempotencyLookup::Miss
+        ));
+        assert_eq!(
+            cache.claim_post_dispatch_effects("Order:o2", "absent"),
+            EffectsClaim::Owner
+        );
     }
 }

@@ -98,6 +98,7 @@ impl ServerState {
             params: serde_json::json!({}),
             idempotency_key: None,
             idempotency_binding: None,
+            idempotency_result: None,
         };
         push_synthetic_event(&mut state, &mut events, created);
 

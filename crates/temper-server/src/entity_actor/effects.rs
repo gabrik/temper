@@ -398,6 +398,7 @@ pub(crate) fn process_action_with_xref_and_field_mode(
                 params: params.clone(),
                 idempotency_key: None,
                 idempotency_binding: None,
+                idempotency_result: None,
             };
 
             ProcessResult {
