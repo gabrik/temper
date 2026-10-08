@@ -317,6 +317,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
     // the underlying page read always materializes full bodies — the cursor can
     // read the ordering properties, and projection can never change membership.
     let select = query_options.select.clone();
+    let count_separately = query_options.count == Some(true) && resume_predicate.is_some();
     let base_filter = match resume_predicate {
         Some(keyset) => Some(and_filter(query_options.filter.clone(), keyset)),
         None => query_options.filter.clone(),
@@ -334,6 +335,28 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         max_entities: request.budget.max_entities.saturating_add(1),
     };
 
+    // A continuation narrows the page, not the collection described by $count.
+    // Reuse the bounded, row-authorized reader with only the original filter;
+    // neither a cursor predicate nor a raw storage candidate count is valid here.
+    // Page one can still obtain its count and rows in the same read.
+    let continuation_count = if count_separately {
+        let count_options = QueryOptions {
+            filter: query_options.filter.clone(),
+            top: Some(0),
+            count: Some(true),
+            ..QueryOptions::default()
+        };
+        read_entity_set_page(QueryPlaneReadRequest {
+            query_options: &count_options,
+            budget: page_budget,
+            ..request
+        })
+        .await?
+        .count
+    } else {
+        None
+    };
+
     let page_options = QueryOptions {
         filter: base_filter,
         select: None,
@@ -346,7 +369,11 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         } else {
             query_options.skip
         },
-        count: query_options.count,
+        count: if count_separately {
+            None
+        } else {
+            query_options.count
+        },
         skiptoken: None,
     };
     let page_request = QueryPlaneReadRequest {
@@ -355,6 +382,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         ..request
     };
     let mut result = read_entity_set_page(page_request).await?;
+    result.count = continuation_count.or(result.count);
 
     // Telemetry is recorded against the original request shape, not the rewritten
     // page read (which strips `$select` and adds the keyset filter).
