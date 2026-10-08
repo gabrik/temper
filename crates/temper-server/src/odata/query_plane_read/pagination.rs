@@ -339,20 +339,21 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
     // Reuse the bounded, row-authorized reader with only the original filter;
     // neither a cursor predicate nor a raw storage candidate count is valid here.
     // Page one can still obtain its count and rows in the same read.
-    let continuation_count = if count_separately {
+    let count_result = if count_separately {
         let count_options = QueryOptions {
             filter: query_options.filter.clone(),
             top: Some(0),
             count: Some(true),
             ..QueryOptions::default()
         };
-        read_entity_set_page(QueryPlaneReadRequest {
-            query_options: &count_options,
-            budget: page_budget,
-            ..request
-        })
-        .await?
-        .count
+        Some(
+            read_entity_set_page(QueryPlaneReadRequest {
+                query_options: &count_options,
+                budget: page_budget,
+                ..request
+            })
+            .await?,
+        )
     } else {
         None
     };
@@ -381,8 +382,20 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
         budget: page_budget,
         ..request
     };
-    let mut result = read_entity_set_page(page_request).await?;
-    result.count = continuation_count.or(result.count);
+    let mut page_result = read_entity_set_page(page_request).await;
+    if let Some(count_result) = count_result {
+        match &mut page_result {
+            Ok(result) => {
+                result.count = count_result.count;
+                result.telemetry.add_scan_work(&count_result.telemetry);
+            }
+            Err(QueryPlaneReadError::QueryTooLarge { telemetry }) => {
+                telemetry.add_scan_work(&count_result.telemetry);
+            }
+            Err(_) => {}
+        }
+    }
+    let mut result = page_result?;
 
     // Telemetry is recorded against the original request shape, not the rewritten
     // page read (which strips `$select` and adds the keyset filter).
@@ -391,6 +404,7 @@ pub(in crate::odata) async fn read_entity_set_from_query_plane(
 
     let truncated = result.entities.len() > page_size;
     result.entities.truncate(page_size);
+    result.telemetry.returned_count = result.entities.len();
 
     let next_skiptoken = if truncated {
         result
