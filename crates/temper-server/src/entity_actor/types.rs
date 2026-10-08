@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use temper_runtime::actor::Message;
 
-// TigerStyle: Fixed resource budgets. No unbounded growth.
-// These are hard limits, not suggestions. Violations are assertion failures.
+// Runtime resource budgets. Domain counter constraints belong to the spec.
 
 /// Maximum unsnapshotted events an actor may replay/hot-hold before refusing new transitions.
 pub const MAX_EVENTS_SINCE_SNAPSHOT: usize = 10_000;
@@ -15,8 +14,6 @@ pub const MAX_EVENTS_SINCE_SNAPSHOT: usize = 10_000;
 pub const MAX_EVENTS_PER_ENTITY: usize = MAX_EVENTS_SINCE_SNAPSHOT;
 /// Default number of recent events retained in memory per entity.
 pub const RECENT_EVENTS_BUDGET_DEFAULT: usize = 50;
-/// Maximum items an entity can hold.
-pub const MAX_ITEMS_PER_ENTITY: usize = 1_000;
 /// Maximum durable idempotency keys retained per entity.
 pub const MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY: usize = 1_000;
 

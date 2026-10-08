@@ -9,7 +9,9 @@ use stateright::{Model, Property};
 use super::semantics::{apply_effects, evaluate_guard, guard_may_hold, successors, truth};
 use temper_spec::predicate::Truth;
 
-use super::types::{LivenessKind, TemperModel, TemperModelAction, TemperModelState};
+use super::types::{
+    LivenessKind, ResolvedTransition, TemperModel, TemperModelAction, TemperModelState,
+};
 
 // -- Property condition functions (bare fn pointers) -------------------------
 
@@ -93,6 +95,44 @@ fn check_reaches_state(model: &TemperModel, state: &TemperModelState) -> bool {
 
 // -- Model trait implementation ----------------------------------------------
 
+impl TemperModel {
+    /// Whether `transition` is enabled in `state`: status precondition, then guard.
+    ///
+    /// The single definition of "this edge may fire here", so that the action
+    /// generator and any caller that applies an action out of band cannot drift
+    /// apart on what the spec permits.
+    fn transition_enabled(
+        &self,
+        transition: &ResolvedTransition,
+        state: &TemperModelState,
+    ) -> bool {
+        let status_ok = transition.from_states.is_empty()
+            || transition.from_states.iter().any(|s| s == &state.status);
+        // Guard checked for *fireability*: a cross-entity guard is a free
+        // boolean, so `guard_may_hold` admits the gated edge rather than
+        // pruning it. See `actions` for why that is the right direction.
+        status_ok && guard_may_hold(&transition.guard, &self.var_kinds, state)
+    }
+
+    /// Whether `action` may fire in `state`.
+    ///
+    /// [`Model::next_state`] cannot answer this: it resolves a transition by
+    /// name and applies it unconditionally, which is sound under Stateright
+    /// (every action it applies came from `actions` for that same state) but
+    /// not for a caller that holds an action across a state change. The
+    /// simulator does exactly that -- it chooses an action while an actor is in
+    /// one state and delivers it, after a fault-injected delay, into another --
+    /// so it must ask this first.
+    ///
+    /// An unknown action name is not enabled; there is no transition to fire.
+    pub fn action_enabled(&self, state: &TemperModelState, action: &TemperModelAction) -> bool {
+        self.transitions
+            .iter()
+            .find(|t| t.name == action.name)
+            .is_some_and(|t| self.transition_enabled(t, state))
+    }
+}
+
 impl Model for TemperModel {
     type State = TemperModelState;
     type Action = TemperModelAction;
@@ -108,18 +148,9 @@ impl Model for TemperModel {
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
         for t in &self.transitions {
-            // Check status precondition
-            let status_ok =
-                t.from_states.is_empty() || t.from_states.iter().any(|s| s == &state.status);
-            if !status_ok {
-                continue;
-            }
-
-            // Check guard for *fireability*. A cross-entity guard is a free
-            // (nondeterministic) boolean: `guard_may_hold` returns true for it,
-            // so the gated edge is offered (guard-true branch). The guard-false
-            // branch is covered by BFS exploring states where it is not taken.
-            if !guard_may_hold(&t.guard, &self.var_kinds, state) {
+            // Status precondition and guard, via the shared predicate that
+            // `action_enabled` also uses -- see there for the guard rationale.
+            if !self.transition_enabled(t, state) {
                 continue;
             }
 

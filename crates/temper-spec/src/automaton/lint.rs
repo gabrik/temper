@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ActionKind, Automaton, Effect, FieldInvariant};
 
+mod absorbing;
+
 /// Severity of a lint finding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +91,7 @@ pub fn lint_automaton(automaton: &Automaton) -> Vec<LintFinding> {
     }
 
     lint_field_invariants(automaton, &mut findings);
+    absorbing::lint(automaton, &mut findings);
 
     findings
 }

@@ -13,11 +13,10 @@
 //!
 //! ## TigerStyle Principles Applied
 //!
-//! - **Assertions in production**: Pre/postcondition assertions on every transition.
-//!   Status must be in the valid state set. Item count must not go negative.
-//!   Event log must grow monotonically. These are not debug-only -- they run always.
-//! - **Bounded execution**: Max events per entity (10,000), max items (1,000).
-//!   No unbounded growth. Violations are detected immediately, not at OOM.
+//! - **Internal consistency**: Debug assertions check transition pre/postconditions.
+//!   User-reachable rejection paths return errors rather than stopping the actor.
+//! - **Bounded execution**: Unsnapshotted events are budgeted and recent history
+//!   is bounded. Domain counter constraints belong to the specification.
 //! - **Explicit error handling**: Every match arm handled. No unwrap on user input.
 //! - **Deterministic**: Same input -> same output. No randomness in transition logic.
 
@@ -42,7 +41,6 @@ use super::idempotency_replay::{DuplicateRequest, idempotency_rejection};
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
     EntityEvent, EntityMsg, EntityResponse, EntityState, MAX_EVENTS_SINCE_SNAPSHOT,
-    MAX_ITEMS_PER_ENTITY,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1226,28 +1224,30 @@ impl Actor for EntityActor {
                     return Ok(());
                 }
 
-                // TigerStyle: Assert preconditions before every transition.
-                // These run in production, not just tests.
+                // A tombstone is a valid runtime state, but not a spec transition
+                // source. Reject new actions without turning a normal caller
+                // error into an actor-stopping debug assertion.
+                if state.status == "Deleted" {
+                    ctx.reply(EntityResponse {
+                        success: false,
+                        state: state.clone(),
+                        error: Some("cannot execute actions after entity deletion".to_string()),
+                        custom_effects: vec![],
+                        scheduled_actions: vec![],
+                        spawn_requests: vec![],
+                        spec_governed: true,
+                    });
+                    return Ok(());
+                }
+
                 debug_assert!(
                     table.states.contains(&state.status),
                     "PRECONDITION: status '{}' not in valid states {:?}",
                     state.status,
                     table.states
                 );
-                debug_assert!(
-                    state.events_since_snapshot < MAX_EVENTS_SINCE_SNAPSHOT,
-                    "PRECONDITION: event budget exhausted ({} >= {})",
-                    state.events_since_snapshot,
-                    MAX_EVENTS_SINCE_SNAPSHOT
-                );
-                debug_assert!(
-                    state.item_count <= MAX_ITEMS_PER_ENTITY,
-                    "PRECONDITION: item budget exceeded ({} > {})",
-                    state.item_count,
-                    MAX_ITEMS_PER_ENTITY
-                );
 
-                // TigerStyle: Budget enforcement (not just assertions -- hard limits)
+                // Exhaustion is a normal refusal in both debug and release.
                 if state.events_since_snapshot >= MAX_EVENTS_SINCE_SNAPSHOT {
                     let workspace_id = event_budget_workspace_id(state);
                     crate::event_budget_metrics::record_exhausted(

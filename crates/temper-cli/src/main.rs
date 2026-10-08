@@ -8,6 +8,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod audit;
 mod codegen;
 mod decide;
 mod init;
@@ -66,6 +67,18 @@ enum Commands {
         /// Missing artifacts and incomplete verification cause failure.
         #[arg(short, long, default_value = "specs")]
         specs_dir: String,
+    },
+    /// Re-check a spec's invariants against the entities on a running server
+    Audit {
+        /// Path to the specs directory
+        #[arg(short, long, default_value = "specs")]
+        specs_dir: String,
+        /// Base URL for the Temper server.
+        #[arg(long, default_value = "http://127.0.0.1:3000")]
+        url: String,
+        /// Tenant to audit. Defaults to `$TEMPER_TENANT`.
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Lint specs locally, then run the verification cascade on a remote Temper server
     VerifyRemote {
@@ -356,6 +369,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             output_dir,
         } => codegen::run(&specs_dir, &output_dir)?,
         Commands::Verify { specs_dir } => verify::run(&specs_dir)?,
+        Commands::Audit {
+            specs_dir,
+            url,
+            tenant,
+        } => audit::run(&specs_dir, &url, tenant.as_deref()).await?,
         Commands::VerifyRemote {
             specs_dir,
             url,
