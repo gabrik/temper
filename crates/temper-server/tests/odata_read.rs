@@ -4,6 +4,8 @@
 //! service document, and error responses via the axum router.
 
 mod common;
+#[path = "odata_read/pagination_count.rs"]
+mod pagination_count;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};

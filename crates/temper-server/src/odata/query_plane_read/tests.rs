@@ -17,6 +17,7 @@ use temper_runtime::tenant::TenantId;
 use temper_spec::csdl::parse_csdl;
 use temper_store_turso::TursoEventStore;
 
+mod count_telemetry;
 mod dst_projection_lag;
 mod keyed_existence;
 mod paging;
