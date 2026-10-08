@@ -141,11 +141,22 @@ async fn local_child_outlives_host_wait(guest_success: bool, quiescent: bool) {
             .unwrap()
     };
     let mut parent = Box::pin(invoke(None));
-    tokio::select! { biased;
-        response = &mut parent => panic!("parent returned before local child execution: {response:?}"),
-        _ = adapter.started.notified() => {},
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("local child never started")
-    }
+    let joined_response = if quiescent {
+        // This child is already released, so completion may precede observing
+        // its started notification. Assert the joined outcome, not poll order.
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), &mut parent)
+                .await
+                .unwrap(),
+        )
+    } else {
+        tokio::select! { biased;
+            response = &mut parent => panic!("parent returned before local child execution: {response:?}"),
+            _ = adapter.started.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("local child never started")
+        }
+        None
+    };
     let token = adapter.hashes.lock().unwrap()[0].clone();
     let parent_key = store
         .dump_journal("default:Parent:one")
@@ -156,9 +167,12 @@ async fn local_child_outlives_host_wait(guest_success: bool, quiescent: bool) {
         .as_str()
         .unwrap()
         .to_owned();
-    let response = tokio::time::timeout(Duration::from_secs(5), parent)
-        .await
-        .unwrap();
+    let response = match joined_response {
+        Some(response) => response,
+        None => tokio::time::timeout(Duration::from_secs(5), parent)
+            .await
+            .unwrap(),
+    };
     let invocations = completed_invocations(&state);
     assert_eq!(invocations.len(), 1);
     assert_eq!(
