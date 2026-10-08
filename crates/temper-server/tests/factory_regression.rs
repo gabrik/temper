@@ -6,7 +6,7 @@
 
 #[path = "factory_regression/harness.rs"]
 mod harness;
-#[path = "factory_regression/idempotency.rs"]
+#[path = "factory_regression/idempotency/mod.rs"]
 mod idempotency;
 #[path = "factory_regression/legacy.rs"]
 mod legacy;

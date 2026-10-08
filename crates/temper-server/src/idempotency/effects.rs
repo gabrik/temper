@@ -117,7 +117,7 @@ impl OperationReceipt {
     pub fn interrupt_worker(&self) {
         self.worker_abort
             .lock()
-            .unwrap()
+            .expect("worker abort lock poisoned")
             .as_ref()
             .expect("owned worker started")
             .abort();
