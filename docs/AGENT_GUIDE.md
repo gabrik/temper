@@ -1064,32 +1064,30 @@ Always maintain this separation when building for users:
 
 Temper follows [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md), TigerBeetle's engineering discipline. Key principles applied:
 
-### Assertions Are Not Just for Testing
+### Assertions Check Internal Consistency
 
-Every entity actor transition has pre and postcondition assertions that run in production (`debug_assert!`):
+Entity actor transitions use `debug_assert!` for internal consistency checks. These assertions are enabled in debug builds, not ordinary release builds:
 
 ```
-PRECONDITION:  status must be in valid state set
-PRECONDITION:  event budget not exhausted (< 10,000)
-PRECONDITION:  item count within budget (<= 1,000)
+PRECONDITION:  live status must be in valid state set
 --- transition executes ---
 POSTCONDITION: status must still be in valid state set
 POSTCONDITION: event log grew by exactly 1
 POSTCONDITION: last event matches the action that fired
 ```
 
-These are the automaton invariants enforced at runtime. The TransitionTable guards are production assertions — if Stateright proved the invariant holds across all 42,847 states, the assertion will never fire. But if a code change breaks an assumption, it fires immediately rather than corrupting state silently.
+Normal admission failures are handled separately in every build. New actions on a deleted entity and actions that exhaust the unsnapshotted-event budget return an error response without stopping the actor. Domain constraints, including any upper bound on an item counter, belong to the specification's guards and invariants; the generic actor does not impose a 1,000-item ceiling.
 
 ### Bounded Execution — Budgets, Not Limits
 
-Everything has a hard budget:
-- `MAX_EVENTS_PER_ENTITY = 10,000` — entity refuses transitions after this
-- `MAX_ITEMS_PER_ENTITY = 1,000` — item additions rejected past this
+Runtime resources have explicit budgets:
+- `MAX_EVENTS_SINCE_SNAPSHOT = 10,000` — the actor refuses new transitions when its unsnapshotted tail reaches this budget, not after 10,000 lifetime events
+- Recent in-memory events and durable idempotency-key membership have bounded retention
 - Mailbox depth is bounded (not unbounded queues)
 - Simulation ticks are bounded (max 500)
 - Property test sequences are bounded (max 30 steps)
 
-When a budget is exceeded, the system fails fast with a clear error — no OOM, no slow degradation, no tail latency spikes.
+When the unsnapshotted-event budget is exhausted, the actor refuses the transition with a clear error while remaining readable. Internal assertions are not a substitute for this admission check.
 
 ### Deterministic Simulation Is the Primary Testing Strategy
 
