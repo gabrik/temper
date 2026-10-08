@@ -1,49 +1,16 @@
-use std::sync::{Arc, OnceLock};
-
-use tokio::sync::Semaphore;
-use tracing::{Instrument, instrument};
+use tracing::instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::entity_actor::{EntityMsg, EntityResponse};
-use crate::idempotency::EffectsClaim;
-use crate::request_context::{AgentContext, remote_parent_context};
+use crate::idempotency::{CompletionResult, OperationRequest};
+use crate::request_context::remote_parent_context;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
 use temper_runtime::scheduler::{sim_now, sim_uuid};
-use temper_runtime::tenant::TenantId;
 
 use super::effects::PostDispatchContext;
 use super::retry;
-use super::{DispatchCommand, DispatchError, DispatchExtOptions, record_workflow_span_attrs};
+use super::{DispatchCommand, DispatchError, record_workflow_span_attrs};
 use crate::state::admission::AdmissionOutcome;
-
-const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
-
-/// Pipeline response and the disposition needed by reaction-cascade callers.
-pub(crate) struct CoreDispatchResult {
-    /// Final result of the owned pipeline or the earlier owner's attempt.
-    pub(crate) response: EntityResponse,
-    /// Only a fresh commit's effects may launch fresh cross-entity reactions.
-    pub(crate) replay: bool,
-}
-
-struct BackgroundReactionDispatch {
-    dispatcher: Arc<crate::trigger::ReactionDispatcher>,
-    tenant: TenantId,
-    entity_type: String,
-    entity_id: String,
-    action: String,
-    to_state: String,
-    fields: serde_json::Value,
-    agent_ctx: AgentContext,
-}
-
-fn background_reaction_semaphore() -> Arc<Semaphore> {
-    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    Arc::clone(
-        SEMAPHORE
-            .get_or_init(|| Arc::new(Semaphore::new(DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY))),
-    )
-}
 
 /// Maximum request-body length, in bytes, echoed into the dispatch-failure log.
 const LOG_REQUEST_BODY_MAX_BYTES: usize = 4096;
@@ -65,345 +32,14 @@ fn truncate_request_body_for_log(serialized: &str) -> String {
 }
 
 impl crate::state::ServerState {
-    /// Dispatch an action using the unified command object.
-    ///
-    /// This is the preferred entry point. The command struct makes all
-    /// parameters explicit (especially tenant) and avoids the previous
-    /// three-layer wrapper chain.
-    #[instrument(skip_all, fields(
-        otel.name = %format_args!("{}.{}", cmd.entity_type, cmd.action),
-        tenant = %cmd.tenant,
-        entity_type = cmd.entity_type,
-        entity_id = cmd.entity_id,
-        action_name = cmd.action,
-    ))]
-    pub async fn dispatch(&self, cmd: DispatchCommand<'_>) -> Result<EntityResponse, String> {
-        self.dispatch_typed(cmd).await.map_err(|e| e.to_string())
-    }
-
-    /// Dispatch an action to an entity actor (legacy single-tenant).
-    #[deprecated(note = "Use `dispatch(DispatchCommand { .. })` with explicit tenant")]
-    pub async fn dispatch_action(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-    ) -> Result<EntityResponse, String> {
-        self.dispatch_tenant_action(
-            &TenantId::default(),
-            entity_type,
-            entity_id,
-            action,
-            params,
-            &AgentContext::for_service("platform-dispatch"),
-        )
-        .await
-    }
-
-    /// Convenience wrapper around [`dispatch`](Self::dispatch) for the common
-    /// case where `await_integration` is `false`.
-    ///
-    /// Callers that need integration await or other options should use
-    /// `dispatch(DispatchCommand { .. })` directly.
-    #[instrument(skip_all, fields(otel.name = %format_args!("{}.{}", entity_type, action), tenant = %tenant, entity_type, entity_id, action_name = action))]
-    pub async fn dispatch_tenant_action(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-        agent_ctx: &AgentContext,
-    ) -> Result<EntityResponse, String> {
-        self.dispatch(DispatchCommand {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx,
-            await_integration: false,
-            await_reactions: true,
-        })
-        .await
-    }
-
-    /// Convenience wrapper around [`dispatch`](Self::dispatch) with full options.
-    #[instrument(skip_all, fields(otel.name = %format_args!("{}.{}", entity_type, action), tenant = %tenant, entity_type, entity_id, action_name = action))]
-    pub async fn dispatch_tenant_action_ext(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-        options: DispatchExtOptions<'_>,
-    ) -> Result<EntityResponse, String> {
-        self.dispatch_tenant_action_ext_typed(
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            options,
-        )
-        .await
-        .map_err(|e| e.to_string())
-    }
-
-    /// Typed variant of [`dispatch_tenant_action_ext`](Self::dispatch_tenant_action_ext).
-    #[instrument(skip_all, fields(otel.name = %format_args!("{}.{}", entity_type, action), tenant = %tenant, entity_type, entity_id, action_name = action))]
-    pub async fn dispatch_tenant_action_ext_typed(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-        options: DispatchExtOptions<'_>,
-    ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed(DispatchCommand {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx: options.agent_ctx,
-            await_integration: options.await_integration,
-            await_reactions: options.await_reactions,
-        })
-        .await
-    }
-
-    /// Dispatch an externally authorized action only if the target actor still
-    /// matches the exact local state used for the Cedar decision.
-    #[instrument(skip_all, fields(
-        otel.name = %format_args!("{}.{}", cmd.entity_type, cmd.action),
-        tenant = %cmd.tenant,
-        entity_type = cmd.entity_type,
-        entity_id = cmd.entity_id,
-        action_name = cmd.action,
-    ))]
-    pub(crate) async fn dispatch_tenant_action_ext_typed_if_current(
-        &self,
-        cmd: DispatchCommand<'_>,
-        expected_authorization_precondition: String,
-    ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, Some(expected_authorization_precondition))
-            .await
-    }
-
-    async fn dispatch_typed(
-        &self,
-        cmd: DispatchCommand<'_>,
-    ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_typed_checked(cmd, None).await
-    }
-
-    async fn dispatch_typed_checked(
-        &self,
-        cmd: DispatchCommand<'_>,
-        expected_authorization_precondition: Option<String>,
-    ) -> Result<EntityResponse, DispatchError> {
-        let DispatchCommand {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx,
-            await_integration,
-            await_reactions,
-        } = cmd;
-
-        if self
-            .composite_metadata_for(tenant, entity_type, action)?
-            .is_some()
-        {
-            self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
-        }
-
-        let CoreDispatchResult { response, replay } = self
-            .dispatch_tenant_action_core_with_disposition(
-                tenant,
-                entity_type,
-                entity_id,
-                action,
-                params,
-                agent_ctx,
-                await_integration,
-                expected_authorization_precondition,
-            )
-            .await?;
-
-        // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
-        if response.success && !replay {
-            // A poisoned lock must not silently disable reactions: the slot
-            // only holds an Arc, so the data can't be torn — recover it.
-            let dispatcher = self
-                .reaction_dispatcher
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(dispatcher) = dispatcher {
-                let to_state = response.state.status.clone();
-                let fields = serde_json::to_value(&response.state.fields).unwrap_or_default();
-                if await_reactions {
-                    dispatcher
-                        .dispatch_reactions(
-                            self,
-                            tenant,
-                            entity_type,
-                            entity_id,
-                            action,
-                            &to_state,
-                            &fields,
-                            0,
-                            // ADR-0046: thread the invoking context through so
-                            // reactions without an explicit principal inherit
-                            // the invoking authority, and declared principals
-                            // can elevate deterministically.
-                            agent_ctx,
-                        )
-                        .await;
-                } else if let Some(background) =
-                    self.try_spawn_background_reactions(BackgroundReactionDispatch {
-                        dispatcher: Arc::clone(&dispatcher),
-                        tenant: tenant.clone(),
-                        entity_type: entity_type.to_string(),
-                        entity_id: entity_id.to_string(),
-                        action: action.to_string(),
-                        to_state,
-                        fields,
-                        agent_ctx: agent_ctx.clone(),
-                    })
-                {
-                    tracing::warn!(
-                        tenant = %tenant,
-                        entity_type,
-                        entity_id,
-                        action_name = action,
-                        "background reaction budget exhausted; awaiting reactions inline"
-                    );
-                    dispatcher
-                        .dispatch_reactions(
-                            self,
-                            tenant,
-                            entity_type,
-                            entity_id,
-                            action,
-                            &background.to_state,
-                            &background.fields,
-                            0,
-                            agent_ctx,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Scheduled actions are handled inside run_post_dispatch_effects
-        // (called from dispatch_tenant_action_core).
-        Ok(response)
-    }
-
-    fn try_spawn_background_reactions(
-        &self,
-        dispatch: BackgroundReactionDispatch,
-    ) -> Option<BackgroundReactionDispatch> {
-        let Ok(permit) = background_reaction_semaphore().try_acquire_owned() else {
-            return Some(dispatch);
-        };
-
-        let state = self.clone();
-        let BackgroundReactionDispatch {
-            dispatcher,
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            to_state,
-            fields,
-            agent_ctx,
-        } = dispatch;
-        // Only detach after acquiring the permit; the fallback awaits inline
-        // and must retain its dependency on any outer effects owner.
-        let agent_ctx = agent_ctx.without_effects_ancestors();
-        let span = tracing::info_span!(
-            "reaction.dispatch.background",
-            tenant = %tenant,
-            entity_type = %entity_type,
-            entity_id = %entity_id,
-            action_name = %action,
-        );
-
-        let reaction_task = async move {
-            let _permit = permit;
-            let results = dispatcher
-                .dispatch_reactions(
-                    &state,
-                    &tenant,
-                    &entity_type,
-                    &entity_id,
-                    &action,
-                    &to_state,
-                    &fields,
-                    0,
-                    &agent_ctx,
-                )
-                .await;
-            tracing::info!(
-                tenant = %tenant,
-                entity_type = %entity_type,
-                entity_id = %entity_id,
-                action_name = %action,
-                reaction.result_count = results.len(),
-                "background reactions completed"
-            );
-        }
-        .instrument(span);
-        tokio::spawn(reaction_task); // determinism-ok: production-only post-commit reaction side effects
-        None
-    }
-
-    /// Core dispatch without reaction cascade (used by ReactionDispatcher to
-    /// avoid infinite async recursion).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn dispatch_tenant_action_core(
-        &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-        agent_ctx: &AgentContext,
-        await_integration: bool,
-        expected_authorization_precondition: Option<String>,
-    ) -> Result<EntityResponse, DispatchError> {
-        self.dispatch_tenant_action_core_with_disposition(
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            params,
-            agent_ctx,
-            await_integration,
-            expected_authorization_precondition,
-        )
-        .await
-        .map(|result| result.response)
-    }
-
-    /// Core dispatch retaining whether the response is a replay, so reaction
-    /// callers never interpret an old successful result as a fresh transition.
-    #[allow(clippy::too_many_arguments)]
+    /// Authorized actor dispatch followed by its registered completion scope.
+    /// Historical replies never infer a fresh reaction obligation.
     #[instrument(skip_all, fields(
         otel.name = "dispatch.dispatch_tenant_action_core",
-        tenant = %tenant,
-        entity_type,
-        entity_id,
-        action_name = action,
+        tenant = %cmd.tenant,
+        entity_type = cmd.entity_type,
+        entity_id = cmd.entity_id,
+        action_name = cmd.action,
         workflow.root_entity_type = tracing::field::Empty,
         workflow.root_entity_id = tracing::field::Empty,
         workflow.run_id = tracing::field::Empty,
@@ -415,17 +51,22 @@ impl crate::state::ServerState {
         success = tracing::field::Empty,
         error_msg = tracing::field::Empty,
     ))]
-    pub(crate) async fn dispatch_tenant_action_core_with_disposition(
+    pub(crate) async fn dispatch_tenant_action_with_completion(
         &self,
-        tenant: &TenantId,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        params: serde_json::Value,
-        agent_ctx: &AgentContext,
-        await_integration: bool,
+        cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,
-    ) -> Result<CoreDispatchResult, DispatchError> {
+        reaction_depth: Option<u32>,
+    ) -> Result<CompletionResult, DispatchError> {
+        let DispatchCommand {
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            params,
+            agent_ctx,
+            await_integration,
+            await_reactions,
+        } = cmd;
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
 
@@ -437,7 +78,6 @@ impl crate::state::ServerState {
             entity_type,
         );
         let mut enriched_agent_ctx = agent_ctx.for_dispatch_root(entity_type, entity_id);
-        let mut workflow_root_active = false;
         if use_workflow_root {
             let root_entity_type = enriched_agent_ctx
                 .workflow_root_entity_type
@@ -458,7 +98,6 @@ impl crate::state::ServerState {
                 workflow_run_id,
                 enriched_agent_ctx.session_id.as_deref(),
             ) {
-                workflow_root_active = true;
                 tracing::Span::current().set_parent(parent);
             }
         } else if let Some(parent) = remote_parent_context(agent_ctx) {
@@ -530,10 +169,7 @@ impl crate::state::ServerState {
                     if let Some(error) = &response.error {
                         tracing::Span::current().record("error_msg", error.as_str());
                     }
-                    return Ok(CoreDispatchResult {
-                        response,
-                        replay: false,
-                    });
+                    return Ok(CompletionResult::response(response));
                 }
             }
         }
@@ -601,7 +237,7 @@ impl crate::state::ServerState {
                 .instrument(admission_span)
                 .await
         };
-        let _admission_permit = match admission_result {
+        let admission_permit = match admission_result {
             AdmissionOutcome::Passthrough => None,
             AdmissionOutcome::Granted(permit) => {
                 let waited = admission_start.elapsed();
@@ -680,6 +316,8 @@ impl crate::state::ServerState {
             .instrument(ask_span)
             .await
         };
+        // Admission gates actor asks, not owned effects or descendant waits.
+        drop(admission_permit);
         // ADR-0048: emit dispatch outcome / attempts / latency metrics.
         let ask_outcome_for_metrics = match &outcome.result {
             Ok(_) => {
@@ -826,109 +464,32 @@ impl crate::state::ServerState {
             return Err(error);
         }
 
-        // Run all post-dispatch effects through the dedicated pipeline.
-        let ctx = PostDispatchContext {
-            tenant,
-            entity_type,
-            entity_id,
-            action,
-            agent_ctx,
-            dispatch_idempotency_key: idempotency_key.as_deref(),
-            action_params: &action_params,
-            await_integration,
-        };
-        // ADR-0182 review correction 1: only the dispatcher that claims a fresh
-        // commit runs its post-dispatch effects. Every other successful reply
-        // for the key is a replay of an earlier commit, not a new transition.
-        let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-        let (response, replay) = if response.success {
-            loop {
-                let claim = match idempotency_key.as_deref() {
-                    Some(idem_key) => self
-                        .idempotency_cache
-                        .claim_post_dispatch_effects(&actor_key, idem_key),
-                    None => EffectsClaim::Uncached,
-                };
-                match claim {
-                    EffectsClaim::Owner(owner) => {
-                        let idem_key = idempotency_key
-                            .as_deref()
-                            .expect("effects owner requires a key");
-                        let response = match agent_ctx.with_effects_ancestor(&actor_key, idem_key) {
-                            Ok(effects_agent_ctx) => {
-                                let effects_ctx = PostDispatchContext {
-                                    agent_ctx: &effects_agent_ctx,
-                                    ..ctx
-                                };
-                                self.run_post_dispatch_effects(&effects_ctx, response).await
-                            }
-                            Err(error) => EntityResponse {
-                                success: false,
-                                error: Some(error.into()),
-                                scheduled_actions: Vec::new(),
-                                spawn_requests: Vec::new(),
-                                ..response
-                            },
-                        };
-                        // Publish the pipeline result, not the actor's earlier
-                        // reply. The claim deliberately excludes the reaction
-                        // cascade: cyclic reactions may revisit this key.
-                        owner.complete(&response);
-                        break (response, false);
-                    }
-                    EffectsClaim::Wait(waiter) => {
-                        if idempotency_key
-                            .as_deref()
-                            .is_some_and(|key| agent_ctx.has_effects_ancestor(&actor_key, key))
-                        {
-                            // An inline integration awaits this callback, so
-                            // waiting for its ancestor would form a cycle.
-                            // Refusal unwinds to the owner, which alone releases
-                            // the claim and notifies independent waiters.
-                            break (EntityResponse {
-                                success: false,
-                                error: Some("inline callback cannot await an ancestor's post-dispatch effects claim".into()),
-                                scheduled_actions: Vec::new(),
-                                spawn_requests: Vec::new(),
-                                ..response
-                            }, true);
-                        }
-                        if let Some(response) = waiter.wait().await {
-                            break (response, true);
-                        }
-                        // The owner was cancelled. Compete for its released
-                        // pending effects without executing the action again.
-                    }
-                    EffectsClaim::Replay(response) => break (*response, true),
-                    EffectsClaim::HistoricalReplay => {
-                        break (self.run_replayed_integrations(&ctx, response).await, true);
-                    }
-                    EffectsClaim::Uncached => {
-                        break (self.run_post_dispatch_effects(&ctx, response).await, false);
-                    }
-                }
-            }
-        } else {
-            (self.run_post_dispatch_effects(&ctx, response).await, false)
-        };
-        if response.success && !replay {
-            self.clear_commons_storage_projection_cache_for_entity(entity_type);
-        }
+        let result = self
+            .complete_committed_operation(
+                OperationRequest {
+                    tenant: tenant.clone(),
+                    entity_type: entity_type.into(),
+                    entity_id: entity_id.into(),
+                    action: action.into(),
+                    params: action_params,
+                    agent_ctx: agent_ctx.clone(),
+                    idempotency_key,
+                    await_integration,
+                    reaction_depth,
+                    detach_reactions: !await_reactions,
+                },
+                response,
+                await_reactions,
+            )
+            .await;
+        let response = &result.response;
 
         tracing::Span::current().record("success", response.success);
         if let Some(ref err) = response.error {
             tracing::Span::current().record("error_msg", err.as_str());
         }
-        if workflow_root_active && let Some(workflow_run_id) = agent_ctx.workflow_run_id.clone() {
-            self.workflow_spans.finish_if_terminal_after_drain(
-                workflow_run_id,
-                entity_type.to_string(),
-                entity_id.to_string(),
-                response.state.status.clone(),
-            );
-        }
 
-        Ok(CoreDispatchResult { response, replay })
+        Ok(result)
     }
 
     /// ADR-0182 review correction 1: a historical idempotent replay (rebuilt
@@ -937,7 +498,7 @@ impl crate::state::ServerState {
     /// webhooks, spawns or scheduled actions. Only the composite triggers the
     /// actor re-emitted for the duplicate are re-run (they are idempotent by
     /// design), mirroring step 5 of `run_post_dispatch_effects`.
-    async fn run_replayed_integrations(
+    pub(super) async fn run_replayed_integrations(
         &self,
         ctx: &PostDispatchContext<'_>,
         response: EntityResponse,

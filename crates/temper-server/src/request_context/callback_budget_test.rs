@@ -224,11 +224,28 @@ fn detached_effect_clears_only_ancestry_preserving_all_other_context() {
     assert_eq!(detached.callback_depth, 7);
     assert_eq!(detached.callback_hops, MAX_CALLBACK_HOPS - 1);
     assert_eq!(detached.idempotency_key, parent.idempotency_key);
-    // Restoring the one intentionally removed field must reproduce the full
-    // original context, including principal, attribution and trace fields.
+    // This context has no owned operation. Restoring its ancestors reproduces
+    // all identity, attribution, tracing and callback-budget fields.
     let restored = AgentContext {
         effects_ancestors: parent.effects_ancestors.clone(),
         ..detached
     };
     assert_eq!(format!("{restored:?}"), format!("{parent:?}"));
+}
+
+#[test]
+fn completion_evidence_and_root_capacity_follow_only_joined_contexts() {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = std::sync::Arc::new(semaphore.clone().try_acquire_owned().unwrap());
+    let parent = AgentContext {
+        completion_capacity: Some(std::sync::Arc::downgrade(&permit)),
+        ..AgentContext::system()
+    };
+    parent.local_completion.mark_unknown();
+    let child = AgentContext::default().inherit_observability_from(&parent);
+    assert!(child.local_completion.is_unknown());
+    assert!(child.completion_capacity.unwrap().upgrade().is_some());
+    let detached = parent.for_background_task();
+    assert!(!detached.local_completion.is_unknown());
+    assert!(detached.completion_capacity.is_none());
 }

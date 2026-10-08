@@ -13,7 +13,7 @@ fn register(state: &ServerState, specs: &[(&str, &str)]) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn detached_state_timer_waits_for_owner_and_takes_over_after_cancellation() {
+async fn detached_state_timer_joins_owned_work_after_caller_cancellation() {
     let (_guard, _, _) = install_deterministic_context(51960);
     let (state, store, adapter) = fixture(51960);
     let spec = SPEC
@@ -39,21 +39,25 @@ async fn detached_state_timer_waits_for_owner_and_takes_over_after_cancellation(
     );
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     drop(owner);
-    tokio::time::timeout(Duration::from_secs(1), adapter.started.notified())
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    adapter.finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), start(&state))
         .await
-        .expect("detached timer did not take over the cancelled owner's effects");
-    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+        .unwrap();
     let binding = request_binding("Start", &json!({}));
     assert!(
         matches!(
-            state.idempotency_cache.lookup_after_effects_applied(
+            state.idempotency_cache.lookup_after_completion(
                 "default:TimedTask:task",
                 "same-key",
                 &binding
             ),
             IdempotencyLookup::Hit(_)
         ),
-        "timer takeover did not complete the released claim"
+        "timer did not join the server-owned completion"
     );
     assert_eq!(
         store
@@ -289,14 +293,36 @@ resolve_target = { kind = "same_id" }
         .await
         .unwrap();
     assert!(parent.success, "{parent:?}");
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
+    let mut parent_terminal = Box::pin(async {
+        state
+            .dispatch_tenant_action_ext(
+                &TenantId::default(),
+                "Parent",
+                "task",
+                "Launch",
+                json!({}),
+                DispatchExtOptions {
+                    agent_ctx: &agent,
+                    await_integration: false,
+                    await_reactions: true,
+                },
+            )
+            .await
+            .unwrap()
+    });
+    // A false ancestry refusal would finish the best-effort parent cascade.
+    // Prove the actual detached reaction remains joined, not merely that it
+    // refrained from running a second integration.
+    assert_waiting(&mut parent_terminal, 51964).await;
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     drop(owner);
-    tokio::time::timeout(Duration::from_secs(1), adapter.started.notified())
-        .await
-        .expect("detached reaction was falsely refused instead of recovering the cancelled owner");
-    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+    assert_waiting(&mut parent_terminal, 51964).await;
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     adapter.finish.notify_one();
+    let (ancestor, parent) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(start(&state), parent_terminal)
+    })
+    .await
+    .unwrap();
+    assert!(ancestor.success && parent.success);
 }

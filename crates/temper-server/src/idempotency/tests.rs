@@ -2,7 +2,7 @@ use super::*;
 use crate::entity_actor::{EntityResponse, EntityState};
 use std::collections::BTreeMap;
 
-fn make_response(status: &str) -> EntityResponse {
+pub(super) fn make_response(status: &str) -> EntityResponse {
     EntityResponse {
         success: true,
         state: EntityState {
@@ -58,7 +58,7 @@ fn different_binding_is_mismatch_not_hit() {
     ));
     // Mismatch is reported even before effects are marked applied.
     assert!(matches!(
-        cache.lookup_after_effects_applied("Order:o1", "key-1", "binding-b"),
+        cache.lookup_after_completion("Order:o1", "key-1", "binding-b"),
         IdempotencyLookup::Mismatch
     ));
 }
@@ -70,12 +70,12 @@ fn pending_effects_do_not_satisfy_protocol_cache_hit() {
 
     assert!(hit_status(cache.lookup("Order:o1", "key-1", B)).is_some());
     assert!(matches!(
-        cache.lookup_after_effects_applied("Order:o1", "key-1", B),
+        cache.lookup_after_completion("Order:o1", "key-1", B),
         IdempotencyLookup::Miss
     ));
 
-    owner(&cache).complete(&make_response("Active"));
-    assert!(hit_status(cache.lookup_after_effects_applied("Order:o1", "key-1", B)).is_some());
+    owner(&cache).complete(CompletionResult::response(make_response("Active")));
+    assert!(hit_status(cache.lookup_after_completion("Order:o1", "key-1", B)).is_some());
 }
 
 #[test]
@@ -141,18 +141,49 @@ fn binding_is_sensitive_to_action_arrays_values_and_nested_odata_keys() {
     }
 }
 
-fn owner(cache: &IdempotencyCache) -> EffectsOwner<'_> {
-    match cache.claim_post_dispatch_effects("Order:o1", "key-1") {
-        EffectsClaim::Owner(owner) => owner,
-        _ => panic!("expected exclusive effects ownership"),
+fn claim(cache: &IdempotencyCache, actor: &str, key: &str) -> OperationClaim {
+    cache.claim_operation(
+        actor,
+        key,
+        OperationRequest {
+            tenant: temper_runtime::tenant::TenantId::default(),
+            entity_type: "Order".into(),
+            entity_id: "o1".into(),
+            action: "Start".into(),
+            params: serde_json::json!({}),
+            agent_ctx: crate::request_context::AgentContext::system(),
+            idempotency_key: Some(key.into()),
+            await_integration: true,
+            reaction_depth: None,
+            detach_reactions: false,
+        },
+    )
+}
+
+fn owner(cache: &IdempotencyCache) -> OperationOwner {
+    match claim(cache, "Order:o1", "key-1") {
+        OperationClaim::Owner(owner) => owner,
+        _ => panic!("expected exclusive ownership"),
     }
 }
 
-fn waiter(cache: &IdempotencyCache) -> EffectsWaiter {
-    match cache.claim_post_dispatch_effects("Order:o1", "key-1") {
-        EffectsClaim::Wait(waiter) => waiter,
-        _ => panic!("expected a subscription, not a successful replay"),
+fn waiter(cache: &IdempotencyCache) -> Arc<OperationReceipt> {
+    match claim(cache, "Order:o1", "key-1") {
+        OperationClaim::Join(receipt) => receipt,
+        _ => panic!("expected existing receipt"),
     }
+}
+
+async fn wait(receipt: Arc<OperationReceipt>) -> EntityResponse {
+    receipt
+        .wait(
+            true,
+            false,
+            &crate::request_context::AgentContext::system(),
+            false,
+        )
+        .await
+        .response
 }
 
 #[tokio::test]
@@ -162,21 +193,21 @@ async fn exactly_one_dispatcher_owns_fresh_commit_effects_and_publishes_final_re
     let first = owner(&cache);
     let waiting = waiter(&cache);
     assert!(matches!(
-        cache.lookup_after_effects_applied("Order:o1", "key-1", B),
+        cache.lookup_after_completion("Order:o1", "key-1", B),
         IdempotencyLookup::Miss
     ));
-    first.complete(&make_response("Done"));
-    assert_eq!(waiting.wait().await.unwrap().state.status, "Done");
+    first.complete(CompletionResult::response(make_response("Done")));
+    assert_eq!(wait(waiting).await.state.status, "Done");
     assert_eq!(
-        hit_status(cache.lookup_after_effects_applied("Order:o1", "key-1", B)).as_deref(),
+        hit_status(cache.lookup_after_completion("Order:o1", "key-1", B)).as_deref(),
         Some("Done")
     );
-    let EffectsClaim::Replay(response) = cache.claim_post_dispatch_effects("Order:o1", "key-1")
-    else {
+    let OperationClaim::Join(receipt) = claim(&cache, "Order:o1", "key-1") else {
         panic!("completed effects must replay")
     };
     assert_eq!(
-        response.state.status, "Done",
+        receipt.terminal().unwrap().state.status,
+        "Done",
         "a dispatcher with an older actor reply still receives the final result"
     );
 }
@@ -190,27 +221,38 @@ async fn failed_attempt_releases_pending_but_existing_waiters_keep_its_failure()
     let mut failed = make_response("Running");
     failed.success = false;
     failed.error = Some("injected effects failure".into());
-    first.complete(&failed);
+    first.complete(CompletionResult::response(failed.clone()));
     assert_eq!(
         hit_status(cache.lookup("Order:o1", "key-1", B)).as_deref(),
         Some("Running")
     );
-    owner(&cache).complete(&make_response("Done"));
-    let response = waiting.wait().await.unwrap();
+    owner(&cache).complete(CompletionResult::response(make_response("Done")));
+    let response = wait(waiting).await;
     assert!(!response.success);
     assert_eq!(response.error, failed.error);
 }
 
 #[tokio::test]
-async fn cancellation_releases_owner_without_a_lost_wakeup() {
+async fn worker_termination_is_not_reclaimable_and_notifies_waiters() {
     let cache = IdempotencyCache::new();
     cache.put("Order:o1", "key-1", B, make_response("Running"));
     let first = owner(&cache);
+    let permit = cache
+        .continuation_slots
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+    first.receipt.retain_permit(Arc::new(permit));
     let waiting = waiter(&cache);
     drop(first);
-    // Cancellation precedes the first poll of the subscription.
-    assert!(waiting.wait().await.is_none());
-    owner(&cache).complete(&make_response("Done"));
+    let response = wait(waiting).await;
+    assert!(!response.success);
+    assert!(response.error.unwrap().contains("completion is unknown"));
+    assert!(matches!(
+        claim(&cache, "Order:o1", "key-1"),
+        OperationClaim::Join(_)
+    ));
+    assert_eq!(cache.continuation_slots.available_permits(), 63);
 }
 
 #[tokio::test]
@@ -234,13 +276,13 @@ async fn active_effects_survive_ttl_eviction_and_replacement() {
         IdempotencyLookup::Hit(_)
     ));
     assert!(matches!(
-        cache.claim_post_dispatch_effects("Order:o1", "key-1"),
-        EffectsClaim::Wait(_)
+        claim(&cache, "Order:o1", "key-1"),
+        OperationClaim::Join(_)
     ));
-    first.complete(&make_response("Done"));
-    assert_eq!(waiting.wait().await.unwrap().state.status, "Done");
+    first.complete(CompletionResult::response(make_response("Done")));
+    assert_eq!(wait(waiting).await.state.status, "Done");
     assert_eq!(
-        hit_status(cache.lookup_after_effects_applied("Order:o1", "key-1", B)).as_deref(),
+        hit_status(cache.lookup_after_completion("Order:o1", "key-1", B)).as_deref(),
         Some("Done")
     );
 }
@@ -250,15 +292,129 @@ fn historical_replays_never_own_transition_effects() {
     let cache = IdempotencyCache::new();
     cache.put_historical("Order:o1", "key-1", B, make_response("Active"));
     assert!(matches!(
-        cache.claim_post_dispatch_effects("Order:o1", "key-1"),
-        EffectsClaim::HistoricalReplay
+        claim(&cache, "Order:o1", "key-1"),
+        OperationClaim::Historical
     ));
     assert!(matches!(
-        cache.lookup_after_effects_applied("Order:o1", "key-1", B),
+        cache.lookup_after_completion("Order:o1", "key-1", B),
         IdempotencyLookup::Miss
     ));
     assert!(matches!(
-        cache.claim_post_dispatch_effects("Order:o2", "absent"),
-        EffectsClaim::Uncached
+        claim(&cache, "Order:o2", "absent"),
+        OperationClaim::Uncached
     ));
+}
+
+#[tokio::test]
+async fn unstarted_reactions_resume_without_rerunning_completed_effects() {
+    let cache = IdempotencyCache::new();
+    cache.put("Order:o1", "key-1", B, make_response("Running"));
+    let first = owner(&cache);
+    let receipt = first.receipt.clone();
+    first.publish_effects(make_response("EffectsReady"));
+    assert!(matches!(
+        cache.lookup_after_completion("Order:o1", "key-1", B),
+        IdempotencyLookup::Miss
+    ));
+    drop(first);
+    assert!(
+        !wait(receipt.clone()).await.success,
+        "ended continuation must notify terminal waiters"
+    );
+    let resumed = owner(&cache);
+    assert!(Arc::ptr_eq(&receipt, &resumed.receipt));
+    assert!(resumed.receipt.phase() == OperationPhase::PendingReactions);
+    let response = resumed.start_reactions();
+    assert_eq!(response.state.status, "EffectsReady");
+    resumed.complete(CompletionResult::response(response));
+    assert_eq!(wait(receipt).await.state.status, "EffectsReady");
+}
+
+#[tokio::test]
+async fn interrupted_reactions_preserve_ready_effects_but_pin_the_root_slot() {
+    let (_guard, clock, _) = temper_runtime::scheduler::install_deterministic_context(51976);
+    let cache = IdempotencyCache::new();
+    cache.put("Order:o1", "key-1", B, make_response("Running"));
+    let first = owner(&cache);
+    let receipt = first.receipt.clone();
+    receipt.retain_permit(Arc::new(
+        cache
+            .continuation_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap(),
+    ));
+    first.publish_effects(make_response("EffectsReady"));
+    first.start_reactions();
+    drop(first);
+    clock.advance_by((IDEMPOTENCY_TTL_SECS as u64 + 1) * 10);
+    for i in 0..=IDEMPOTENCY_BUDGET_PER_ACTOR {
+        cache.put("Order:o1", &format!("other-{i}"), B, make_response("Other"));
+    }
+    cache.put_historical("Order:o1", "key-1", "wrong-binding", make_response("Old"));
+    assert!(matches!(
+        cache.lookup("Order:o1", "key-1", "wrong-binding"),
+        IdempotencyLookup::Mismatch
+    ));
+    assert!(matches!(
+        claim(&cache, "Order:o1", "key-1"),
+        OperationClaim::Join(_)
+    ));
+    assert_eq!(cache.continuation_slots.available_permits(), 63);
+    let context = crate::request_context::AgentContext::system();
+    assert_eq!(
+        receipt
+            .wait(false, false, &context, false)
+            .await
+            .response
+            .state
+            .status,
+        "EffectsReady"
+    );
+    assert!(
+        !receipt
+            .wait(true, false, &context, false)
+            .await
+            .response
+            .success
+    );
+}
+
+#[tokio::test]
+async fn reaction_phase_recovery_reregisters_existing_observers_after_coalesced_signals() {
+    use super::wait_graph::Registration;
+    use futures_util::poll;
+    let cache = IdempotencyCache::new();
+    cache.put("Order:o1", "parent", B, make_response("Running"));
+    let OperationClaim::Owner(parent) = claim(&cache, "Order:o1", "parent") else {
+        panic!("parent owner")
+    };
+    parent.publish_effects(make_response("Ready"));
+    parent.start_reactions();
+    cache.put("Order:o1", "key-1", B, make_response("Running"));
+    let first = owner(&cache);
+    let receipt = first.receipt.clone();
+    first.publish_effects(make_response("Ready"));
+    let context = crate::request_context::AgentContext {
+        local_completion: crate::request_context::LocalCompletionEvidence::for_operation(
+            &parent.receipt,
+        ),
+        ..crate::request_context::AgentContext::system()
+    };
+    let mut observer = Box::pin(receipt.wait(true, false, &context, false));
+    assert!(poll!(observer.as_mut()).is_pending());
+    drop(first);
+    let resumed = owner(&cache);
+    // The observer never polls the intervening recoverable failure snapshot.
+    assert!(poll!(observer.as_mut()).is_pending());
+    resumed.start_reactions();
+    assert!(
+        matches!(
+            cache
+                .wait_graph
+                .register(&resumed.receipt, &parent.receipt, true),
+            Registration::ReactionBackEdge
+        ),
+        "coalesced phase signals lost the observer's real dependency"
+    );
 }

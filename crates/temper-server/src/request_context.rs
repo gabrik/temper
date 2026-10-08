@@ -11,7 +11,11 @@ use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, Tra
 use temper_authz::SecurityContext;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+mod local_completion;
+mod local_dispatch;
+pub use local_dispatch::LocalDispatchContext;
 mod observation_metadata;
+pub use local_completion::LocalCompletionEvidence;
 
 /// Maximum callbacks along one server-owned internal context lineage.
 ///
@@ -49,6 +53,11 @@ pub struct AgentContext {
     /// this inline lineage. Never populated from headers; bounded on entry by
     /// `MAX_CALLBACK_HOPS`. Detached tasks begin a new effects ancestry.
     pub effects_ancestors: Vec<(String, String)>,
+    /// Runtime-owned local completion evidence; never accepted from headers.
+    pub local_completion: LocalCompletionEvidence,
+    /// Root completion capacity inherited by logically joined descendants.
+    /// Weak so a completed receipt never retains a root slot through context.
+    pub completion_capacity: Option<std::sync::Weak<tokio::sync::OwnedSemaphorePermit>>,
     /// Full Cedar security context when known at the request boundary.
     ///
     /// External HTTP entrypoints populate this after credential resolution so
@@ -137,6 +146,8 @@ impl AgentContext {
     pub(crate) fn without_effects_ancestors(&self) -> Self {
         let mut next = self.clone();
         next.effects_ancestors.clear();
+        next.local_completion = LocalCompletionEvidence::default();
+        next.completion_capacity = None;
         next
     }
 
@@ -161,6 +172,8 @@ impl AgentContext {
             callback_depth: 0,
             callback_hops: 0,
             effects_ancestors: Vec::new(),
+            local_completion: LocalCompletionEvidence::default(),
+            completion_capacity: None,
             security_ctx: Some(SecurityContext::system()),
             agent_id: Some("system".to_string()),
             session_id: None,
@@ -199,6 +212,8 @@ impl AgentContext {
             callback_depth: 0,
             callback_hops: 0,
             effects_ancestors: Vec::new(),
+            local_completion: LocalCompletionEvidence::default(),
+            completion_capacity: None,
             security_ctx: Some(security_ctx),
             agent_id: Some(service_id),
             session_id: None,
@@ -236,6 +251,8 @@ impl AgentContext {
         self.callback_depth = parent.callback_depth;
         self.callback_hops = parent.callback_hops;
         self.effects_ancestors = parent.effects_ancestors.clone();
+        self.local_completion = parent.local_completion.clone();
+        self.completion_capacity = parent.completion_capacity.clone();
         self.session_id = parent.session_id.clone();
         self.intent = parent.intent.clone();
         self.trace_id = parent.trace_id.clone();
@@ -348,6 +365,8 @@ pub(crate) fn extract_agent_context(headers: &HeaderMap) -> AgentContext {
         callback_depth: 0,
         callback_hops: 0,
         effects_ancestors: Vec::new(),
+        local_completion: LocalCompletionEvidence::default(),
+        completion_capacity: None,
         security_ctx: None,
         agent_id: None,
         session_id,

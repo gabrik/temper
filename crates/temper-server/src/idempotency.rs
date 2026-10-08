@@ -9,7 +9,7 @@
 //! body is a [`IdempotencyLookup::Mismatch`], never a cached success.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use sha2::{Digest, Sha256};
 use temper_runtime::scheduler::sim_now;
@@ -155,6 +155,9 @@ pub const IDEMPOTENCY_BUDGET_PER_ACTOR: usize = 1_000;
 /// Time-to-live for idempotency entries in seconds.
 pub const IDEMPOTENCY_TTL_SECS: i64 = 3600;
 
+/// Root continuation capacity; descendants share their root's lease.
+const ROOT_COMPLETION_BUDGET: usize = 64;
+
 /// A cached idempotent response.
 struct IdempotencyEntry {
     /// The cached response to return on duplicate requests.
@@ -163,13 +166,26 @@ struct IdempotencyEntry {
     binding: String,
     /// When this entry was created (for TTL eviction).
     created_at: chrono::DateTime<chrono::Utc>,
-    /// Who owns the post-dispatch effects of the commit behind this entry.
+    /// Receipt owning the effects and registered reaction obligation.
     effects: EffectsState,
 }
 
+impl IdempotencyEntry {
+    fn last_progress_at(&self) -> chrono::DateTime<chrono::Utc> {
+        match &self.effects {
+            EffectsState::Operation(receipt) => receipt.finished_at().unwrap_or(self.created_at),
+            _ => self.created_at,
+        }
+    }
+}
+
 mod effects;
+mod wait_graph;
 use effects::EffectsState;
-pub use effects::{EffectsClaim, EffectsOwner, EffectsWaiter};
+pub(crate) use effects::{
+    CompletionResult, OperationClaim, OperationOwner, OperationPhase, OperationReceipt,
+    OperationRequest,
+};
 
 /// Per-entity-actor idempotency cache.
 ///
@@ -178,6 +194,14 @@ pub use effects::{EffectsClaim, EffectsOwner, EffectsWaiter};
 pub struct IdempotencyCache {
     /// actor_key → (idempotency_key → entry).
     entries: RwLock<BTreeMap<String, BTreeMap<String, IdempotencyEntry>>>,
+    pub(crate) continuation_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) wait_graph: Arc<wait_graph::WaitGraph>,
+    #[cfg(test)]
+    pub(crate) missing_receipt_once: std::sync::Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    pub(crate) reaction_handoff_once: std::sync::Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    pub(crate) interrupt_action_once: std::sync::Mutex<Option<(String, String, String)>>,
 }
 
 impl IdempotencyCache {
@@ -185,6 +209,14 @@ impl IdempotencyCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            wait_graph: Arc::new(wait_graph::WaitGraph::default()),
+            #[cfg(test)]
+            missing_receipt_once: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            reaction_handoff_once: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            interrupt_action_once: std::sync::Mutex::new(None),
+            continuation_slots: Arc::new(tokio::sync::Semaphore::new(ROOT_COMPLETION_BUDGET)),
         }
     }
 
@@ -193,13 +225,13 @@ impl IdempotencyCache {
         self.lookup_inner(actor_key, idem_key, binding, false)
     }
 
-    /// Bound lookup that only reports a hit after post-dispatch effects ran.
+    /// Bound lookup that only reports a hit after the registered operation completes.
     ///
-    /// HTTP/OData callers use this stricter lookup so a retry after a dropped
-    /// actor reply re-enters dispatch and fires effects instead of short-
-    /// circuiting at the protocol boundary. A mismatch is reported regardless
+    /// HTTP/OData callers use this stricter lookup so retries join the
+    /// registered reaction terminal milestone, rather than short-circuiting
+    /// on either a committed actor reply or effects readiness alone. A mismatch is reported regardless
     /// of effect state: the key is bound as soon as the first request succeeds.
-    pub fn lookup_after_effects_applied(
+    pub fn lookup_after_completion(
         &self,
         actor_key: &str,
         idem_key: &str,
@@ -213,7 +245,7 @@ impl IdempotencyCache {
         actor_key: &str,
         idem_key: &str,
         binding: &str,
-        require_effects_applied: bool,
+        require_completion: bool,
     ) -> IdempotencyLookup {
         let now = sim_now();
         let entries = match self.entries.read() {
@@ -227,14 +259,19 @@ impl IdempotencyCache {
             return IdempotencyLookup::Miss;
         };
 
-        let age = now.signed_duration_since(entry.created_at);
+        let age = now.signed_duration_since(entry.last_progress_at());
         if !entry.effects.is_claimed() && age.num_seconds() > IDEMPOTENCY_TTL_SECS {
             return IdempotencyLookup::Miss;
         }
         if entry.binding != binding {
             return IdempotencyLookup::Mismatch;
         }
-        if require_effects_applied && !matches!(entry.effects, EffectsState::Applied) {
+        if let EffectsState::Operation(receipt) = &entry.effects
+            && let Some(response) = receipt.terminal()
+        {
+            return IdempotencyLookup::Hit(Box::new(response));
+        }
+        if require_completion {
             return IdempotencyLookup::Miss;
         }
         IdempotencyLookup::Hit(Box::new(entry.response.clone()))
@@ -295,7 +332,10 @@ impl IdempotencyCache {
         // Evict expired entries first, except active owners.
         actor_entries.retain(|_, entry| {
             entry.effects.is_claimed()
-                || now.signed_duration_since(entry.created_at).num_seconds() <= IDEMPOTENCY_TTL_SECS
+                || now
+                    .signed_duration_since(entry.last_progress_at())
+                    .num_seconds()
+                    <= IDEMPOTENCY_TTL_SECS
         });
 
         // Budget enforcement: evict oldest if at capacity.
@@ -304,7 +344,7 @@ impl IdempotencyCache {
             if let Some(oldest_key) = actor_entries
                 .iter()
                 .filter(|(_, entry)| !entry.effects.is_claimed())
-                .min_by_key(|(_, e)| e.created_at)
+                .min_by_key(|(_, e)| e.last_progress_at())
                 .map(|(k, _)| k.clone())
             {
                 actor_entries.remove(&oldest_key);

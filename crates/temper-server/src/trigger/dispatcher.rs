@@ -239,15 +239,19 @@ impl ReactionDispatcher {
             // to avoid infinite async recursion — we handle cascading ourselves).
             fired_count += 1;
             let dispatch_result = state
-                .dispatch_tenant_action_core_with_disposition(
-                    tenant,
-                    &rule.then.entity_type,
-                    &target_entity_id,
-                    &rule.then.action,
-                    effective_params,
-                    &dispatch_ctx,
-                    false,
+                .dispatch_tenant_action_with_completion(
+                    crate::state::DispatchCommand {
+                        tenant,
+                        entity_type: &rule.then.entity_type,
+                        entity_id: &target_entity_id,
+                        action: &rule.then.action,
+                        params: effective_params,
+                        agent_ctx: &dispatch_ctx,
+                        await_integration: false,
+                        await_reactions: true,
+                    },
                     None,
+                    Some(depth + 1),
                 )
                 .await;
 
@@ -270,23 +274,7 @@ impl ReactionDispatcher {
                         depth,
                     });
 
-                    // A replayed child did not commit a fresh transition.
-                    // Only fresh successes cascade, under the same authority.
-                    if response.success && !result.replay {
-                        let cascade_results = Box::pin(self.dispatch_reactions(
-                            state,
-                            tenant,
-                            &rule.then.entity_type,
-                            &target_entity_id,
-                            &rule.then.action,
-                            &target_status,
-                            &serde_json::to_value(&response.state.fields).unwrap_or_default(),
-                            depth + 1,
-                            &dispatch_ctx,
-                        ))
-                        .await;
-                        results.extend(cascade_results);
-                    }
+                    results.extend(result.reactions);
                 }
                 Err(e) => {
                     dispatch_error_count += 1;

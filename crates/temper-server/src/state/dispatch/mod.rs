@@ -13,11 +13,13 @@ mod actions;
 mod adapter;
 mod authenticated_params;
 mod compensation;
+mod completion;
 mod composite;
 mod cross_entity;
 mod effects;
 mod generated_callbacks;
 mod projection_barrier;
+mod request;
 pub(crate) mod retry;
 pub(crate) mod state_timeouts;
 #[cfg(test)]

@@ -187,13 +187,16 @@ impl crate::state::ServerState {
 
             let response = self
                 .dispatch_tenant_action_core(
-                    tenant,
-                    &prepared.entity_type,
-                    &prepared.entity_id,
-                    &prepared.action,
-                    prepared.unresolved_params,
-                    &sub_agent_ctx,
-                    false,
+                    super::DispatchCommand {
+                        tenant,
+                        entity_type: &prepared.entity_type,
+                        entity_id: &prepared.entity_id,
+                        action: &prepared.action,
+                        params: prepared.unresolved_params,
+                        agent_ctx: &sub_agent_ctx,
+                        await_integration: false,
+                        await_reactions: false,
+                    },
                     None,
                 )
                 .await?;

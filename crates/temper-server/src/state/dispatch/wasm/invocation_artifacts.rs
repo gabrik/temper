@@ -120,6 +120,11 @@ impl crate::state::ServerState {
             None
         };
 
+        ctx.agent_ctx
+            .local_completion
+            .require_known_result()
+            .map_err(|e| e.to_string())?;
+
         if let Some(cb) = on_failure {
             let mut params = serde_json::json!({
                 "error": error_str.clone(),
@@ -157,6 +162,10 @@ impl crate::state::ServerState {
         agent_ctx: &AgentContext,
         mode: WasmDispatchMode,
     ) -> Result<Option<EntityResponse>, String> {
+        agent_ctx
+            .local_completion
+            .require_known_result()
+            .map_err(|e| e.to_string())?;
         let callback_ctx = match agent_ctx.for_callback() {
             Ok(context) => context,
             Err(error) => {
@@ -201,6 +210,10 @@ impl crate::state::ServerState {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+                agent_ctx
+                    .local_completion
+                    .require_known_result()
+                    .map_err(|e| e.to_string())?;
                 if !resp.success {
                     self.record_generated_callback_refusal(
                         entity_ref,

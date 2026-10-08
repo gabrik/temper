@@ -92,7 +92,7 @@ async fn http_idempotency_waiter_cannot_apply_failed_owner_and_checks_auth_and_b
     );
     let binding = temper_server::idempotency::request_binding("Start", &json!({}));
     assert!(matches!(
-        state.idempotency_cache.lookup_after_effects_applied(
+        state.idempotency_cache.lookup_after_completion(
             "default:TimedTask:task",
             "same-key",
             &binding

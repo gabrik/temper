@@ -192,7 +192,7 @@ async fn concurrent_idempotency_retry_shares_failure_then_recovers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancelled_idempotency_owner_releases_claim_to_waiter() {
+async fn cancelled_caller_leaves_owned_execution_for_waiter() {
     let (_guard, _, _) = install_deterministic_context(51911);
     let (state, _, adapter) = fixture(51911);
     let mut owner = Box::pin(start(&state));
@@ -209,7 +209,7 @@ async fn cancelled_idempotency_owner_releases_claim_to_waiter() {
         .expect("cancelled owner stranded claim");
     assert!(response.success, "{response:?}");
     assert_eq!(response.state.status, "Running");
-    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
 }
 
 #[path = "http.rs"]

@@ -145,6 +145,7 @@ pub(super) async fn dispatch_bound_action(
         let pd = record_authz_denial(
             state,
             DenialInput {
+                execution_ctx: Some(agent_ctx),
                 tenant: tenant.as_str(),
                 security_ctx,
                 agent_id_override: agent_ctx.agent_id.as_deref(),
@@ -220,6 +221,7 @@ pub(super) async fn dispatch_bound_action(
         entity_type,
         owner_id_from_action(&current_state.state.fields, &resolved_body),
         security_ctx,
+        agent_ctx,
     )
     .await
     {
@@ -297,7 +299,7 @@ pub(super) async fn dispatch_bound_action(
     let actor_key = idempotency_actor_key(tenant, entity_type, key_str);
     let request_binding = crate::idempotency::request_binding(action, &resolved_body);
     if let Some(ref idem_key) = idempotency_key {
-        match state.idempotency_cache.lookup_after_effects_applied(
+        match state.idempotency_cache.lookup_after_completion(
             &actor_key,
             idem_key,
             &request_binding,
