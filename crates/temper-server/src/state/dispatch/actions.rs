@@ -18,6 +18,14 @@ use crate::state::admission::AdmissionOutcome;
 
 const DEFAULT_BACKGROUND_REACTION_MAX_CONCURRENCY: usize = 64;
 
+/// Pipeline response and the disposition needed by reaction-cascade callers.
+pub(crate) struct CoreDispatchResult {
+    /// Final result of the owned pipeline or the earlier owner's attempt.
+    pub(crate) response: EntityResponse,
+    /// Only a fresh commit's effects may launch fresh cross-entity reactions.
+    pub(crate) replay: bool,
+}
+
 struct BackgroundReactionDispatch {
     dispatcher: Arc<crate::trigger::ReactionDispatcher>,
     tenant: TenantId,
@@ -216,8 +224,8 @@ impl crate::state::ServerState {
             self.reject_action_supplied_sub_writes(entity_type, action, &params)?;
         }
 
-        let response = self
-            .dispatch_tenant_action_core(
+        let CoreDispatchResult { response, replay } = self
+            .dispatch_tenant_action_core_with_disposition(
                 tenant,
                 entity_type,
                 entity_id,
@@ -230,7 +238,7 @@ impl crate::state::ServerState {
             .await?;
 
         // Dispatch cross-entity reactions (fire-and-forget, depth 0 = top-level)
-        if response.success {
+        if response.success && !replay {
             // A poisoned lock must not silently disable reactions: the slot
             // only holds an Arc, so the data can't be torn — recover it.
             let dispatcher = self
@@ -319,6 +327,9 @@ impl crate::state::ServerState {
             fields,
             agent_ctx,
         } = dispatch;
+        // Only detach after acquiring the permit; the fallback awaits inline
+        // and must retain its dependency on any outer effects owner.
+        let agent_ctx = agent_ctx.without_effects_ancestors();
         let span = tracing::info_span!(
             "reaction.dispatch.background",
             tenant = %tenant,
@@ -359,6 +370,34 @@ impl crate::state::ServerState {
     /// Core dispatch without reaction cascade (used by ReactionDispatcher to
     /// avoid infinite async recursion).
     #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_tenant_action_core(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+        action: &str,
+        params: serde_json::Value,
+        agent_ctx: &AgentContext,
+        await_integration: bool,
+        expected_authorization_precondition: Option<String>,
+    ) -> Result<EntityResponse, DispatchError> {
+        self.dispatch_tenant_action_core_with_disposition(
+            tenant,
+            entity_type,
+            entity_id,
+            action,
+            params,
+            agent_ctx,
+            await_integration,
+            expected_authorization_precondition,
+        )
+        .await
+        .map(|result| result.response)
+    }
+
+    /// Core dispatch retaining whether the response is a replay, so reaction
+    /// callers never interpret an old successful result as a fresh transition.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(
         otel.name = "dispatch.dispatch_tenant_action_core",
         tenant = %tenant,
@@ -376,7 +415,7 @@ impl crate::state::ServerState {
         success = tracing::field::Empty,
         error_msg = tracing::field::Empty,
     ))]
-    pub(crate) async fn dispatch_tenant_action_core(
+    pub(crate) async fn dispatch_tenant_action_core_with_disposition(
         &self,
         tenant: &TenantId,
         entity_type: &str,
@@ -386,7 +425,7 @@ impl crate::state::ServerState {
         agent_ctx: &AgentContext,
         await_integration: bool,
         expected_authorization_precondition: Option<String>,
-    ) -> Result<EntityResponse, DispatchError> {
+    ) -> Result<CoreDispatchResult, DispatchError> {
         let params =
             self.resolve_authenticated_params(tenant, entity_type, action, params, agent_ctx)?;
 
@@ -491,7 +530,10 @@ impl crate::state::ServerState {
                     if let Some(error) = &response.error {
                         tracing::Span::current().record("error_msg", error.as_str());
                     }
-                    return Ok(response);
+                    return Ok(CoreDispatchResult {
+                        response,
+                        replay: false,
+                    });
                 }
             }
         }
@@ -799,38 +841,77 @@ impl crate::state::ServerState {
         // commit runs its post-dispatch effects. Every other successful reply
         // for the key is a replay of an earlier commit, not a new transition.
         let actor_key = format!("{tenant}:{entity_type}:{entity_id}");
-        let claim = match idempotency_key.as_deref() {
-            Some(idem_key) if response.success => self
-                .idempotency_cache
-                .claim_post_dispatch_effects(&actor_key, idem_key),
-            _ => EffectsClaim::Owner,
-        };
-        let response = match claim {
-            EffectsClaim::Owner => {
-                let response = self.run_post_dispatch_effects(&ctx, response).await;
-                if let Some(ref idem_key) = idempotency_key {
-                    if response.success {
-                        self.idempotency_cache
-                            .mark_effects_applied(&actor_key, idem_key);
-                    } else {
-                        self.idempotency_cache
-                            .release_effects_claim(&actor_key, idem_key);
+        let (response, replay) = if response.success {
+            loop {
+                let claim = match idempotency_key.as_deref() {
+                    Some(idem_key) => self
+                        .idempotency_cache
+                        .claim_post_dispatch_effects(&actor_key, idem_key),
+                    None => EffectsClaim::Uncached,
+                };
+                match claim {
+                    EffectsClaim::Owner(owner) => {
+                        let idem_key = idempotency_key
+                            .as_deref()
+                            .expect("effects owner requires a key");
+                        let response = match agent_ctx.with_effects_ancestor(&actor_key, idem_key) {
+                            Ok(effects_agent_ctx) => {
+                                let effects_ctx = PostDispatchContext {
+                                    agent_ctx: &effects_agent_ctx,
+                                    ..ctx
+                                };
+                                self.run_post_dispatch_effects(&effects_ctx, response).await
+                            }
+                            Err(error) => EntityResponse {
+                                success: false,
+                                error: Some(error.into()),
+                                scheduled_actions: Vec::new(),
+                                spawn_requests: Vec::new(),
+                                ..response
+                            },
+                        };
+                        // Publish the pipeline result, not the actor's earlier
+                        // reply. The claim deliberately excludes the reaction
+                        // cascade: cyclic reactions may revisit this key.
+                        owner.complete(&response);
+                        break (response, false);
+                    }
+                    EffectsClaim::Wait(waiter) => {
+                        if idempotency_key
+                            .as_deref()
+                            .is_some_and(|key| agent_ctx.has_effects_ancestor(&actor_key, key))
+                        {
+                            // An inline integration awaits this callback, so
+                            // waiting for its ancestor would form a cycle.
+                            // Refusal unwinds to the owner, which alone releases
+                            // the claim and notifies independent waiters.
+                            break (EntityResponse {
+                                success: false,
+                                error: Some("inline callback cannot await an ancestor's post-dispatch effects claim".into()),
+                                scheduled_actions: Vec::new(),
+                                spawn_requests: Vec::new(),
+                                ..response
+                            }, true);
+                        }
+                        if let Some(response) = waiter.wait().await {
+                            break (response, true);
+                        }
+                        // The owner was cancelled. Compete for its released
+                        // pending effects without executing the action again.
+                    }
+                    EffectsClaim::Replay(response) => break (*response, true),
+                    EffectsClaim::HistoricalReplay => {
+                        break (self.run_replayed_integrations(&ctx, response).await, true);
+                    }
+                    EffectsClaim::Uncached => {
+                        break (self.run_post_dispatch_effects(&ctx, response).await, false);
                     }
                 }
-                response
             }
-            EffectsClaim::Replay => {
-                tracing::debug!(tenant = %tenant, entity_type, entity_id, action,
-                    "idempotent replay: post-dispatch effects owned by the original commit");
-                response
-            }
-            EffectsClaim::HistoricalReplay => {
-                tracing::debug!(tenant = %tenant, entity_type, entity_id, action,
-                    "historical idempotent replay: no transition effects");
-                self.run_replayed_integrations(&ctx, response).await
-            }
+        } else {
+            (self.run_post_dispatch_effects(&ctx, response).await, false)
         };
-        if response.success {
+        if response.success && !replay {
             self.clear_commons_storage_projection_cache_for_entity(entity_type);
         }
 
@@ -847,7 +928,7 @@ impl crate::state::ServerState {
             );
         }
 
-        Ok(response)
+        Ok(CoreDispatchResult { response, replay })
     }
 
     /// ADR-0182 review correction 1: a historical idempotent replay (rebuilt

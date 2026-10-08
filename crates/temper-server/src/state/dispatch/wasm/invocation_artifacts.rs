@@ -282,7 +282,8 @@ impl crate::state::ServerState {
 
         let state_c = self.clone();
         let gd_id = format!("GD-{}", sim_uuid());
-        let dispatch_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
+        let dispatch_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx)
+            .without_effects_ancestors();
         let gd_params = serde_json::json!({
             "tenant": entity_ref.tenant.as_str(), "agent_id": "wasm-module",
             "action_name": "http_call", "resource_type": "HttpEndpoint",

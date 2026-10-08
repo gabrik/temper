@@ -366,7 +366,7 @@ impl crate::state::ServerState {
             let entity_id = ctx.entity_id.to_string();
             let target_state = st.state.clone();
             let target_action = st.on_timeout.clone();
-            let agent_ctx = ctx.agent_ctx.clone();
+            let agent_ctx = ctx.agent_ctx.without_effects_ancestors();
             let key_for_task = key.clone();
             let entity_type_for_dec = ctx.entity_type.to_string();
             let workflow_root_entity_type = agent_ctx

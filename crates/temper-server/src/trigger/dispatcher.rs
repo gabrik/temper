@@ -239,7 +239,7 @@ impl ReactionDispatcher {
             // to avoid infinite async recursion — we handle cascading ourselves).
             fired_count += 1;
             let dispatch_result = state
-                .dispatch_tenant_action_core(
+                .dispatch_tenant_action_core_with_disposition(
                     tenant,
                     &rule.then.entity_type,
                     &target_entity_id,
@@ -252,7 +252,8 @@ impl ReactionDispatcher {
                 .await;
 
             match dispatch_result {
-                Ok(response) => {
+                Ok(result) => {
+                    let response = result.response;
                     let target_status = response.state.status.clone();
                     if response.success {
                         success_count += 1;
@@ -269,10 +270,9 @@ impl ReactionDispatcher {
                         depth,
                     });
 
-                    // Recurse if the target action succeeded. The cascade
-                    // fires under the same dispatch context as this rule —
-                    // elevation propagates down the chain.
-                    if response.success {
+                    // A replayed child did not commit a fresh transition.
+                    // Only fresh successes cascade, under the same authority.
+                    if response.success && !result.replay {
                         let cascade_results = Box::pin(self.dispatch_reactions(
                             state,
                             tenant,

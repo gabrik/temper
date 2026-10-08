@@ -350,16 +350,8 @@ pub(super) async fn dispatch_bound_action(
     let response = match result {
         Ok(response) => {
             if response.success {
-                // Cache for idempotency
-                if let Some(ref idem_key) = idempotency_key {
-                    state.idempotency_cache.put_effects_applied(
-                        &actor_key,
-                        idem_key,
-                        &request_binding,
-                        response.clone(),
-                    );
-                }
-
+                // Dispatch's effects owner publishes the final cached result.
+                // A protocol replay must never complete or replace its claim.
                 http_span.set_status(Status::Ok);
                 http_span.set_attribute(OtelKeyValue::new("http.status_code", 200i64));
 
