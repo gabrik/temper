@@ -113,7 +113,7 @@ pub(super) async fn dispatch_bound_action(
     }
 
     let authz_snapshot = match state
-        .load_authz_resource_snapshot(tenant, entity_type, key_str)
+        .load_bound_action_snapshot(tenant, entity_type, key_str)
         .await
     {
         Ok(v) => v,
@@ -170,6 +170,16 @@ pub(super) async fn dispatch_bound_action(
         http_span.end_with_timestamp(end_time);
         let reason_with_id = format!("{reason} (decision: {})", pd.id);
         return odata_denial(&reason_with_id, &pd.id).into_response();
+    }
+
+    // Authorization precedes existence disclosure, including actions named Create.
+    if !authz_snapshot.exists {
+        let error = DispatchError::NotFound(format!("{entity_type}:{key_str}"));
+        http_span.set_status(Status::error(error.to_string()));
+        http_span.set_attribute(OtelKeyValue::new("http.status_code", 404i64));
+        http_span.end_with_timestamp(sim_now().into());
+        return odata_error(StatusCode::NOT_FOUND, "EntityNotFound", &error.to_string())
+            .into_response();
     }
 
     if let Err(error) = state.check_verification_gate(tenant, entity_type) {
@@ -251,47 +261,7 @@ pub(super) async fn dispatch_bound_action(
         return resp;
     }
 
-    if !authz_snapshot.exists {
-        let validation = state
-            .transition_table_for_dispatch(tenant, entity_type)
-            .map_err(|error| error.to_string())
-            .and_then(|table| {
-                table.validate_action_params(
-                    action.rsplit('.').next().unwrap_or(action),
-                    &resolved_body,
-                    &current_state.state.fields,
-                    &current_state.state.counters,
-                    &current_state.state.booleans,
-                )
-            });
-        if let Err(error) = validation {
-            http_span.set_status(Status::error("StrictActionContract"));
-            http_span.set_attribute(OtelKeyValue::new("http.status_code", 409i64));
-            http_span.end_with_timestamp(sim_now().into());
-            return odata_error(StatusCode::CONFLICT, "StrictActionContract", &error)
-                .into_response();
-        }
-    }
-
-    let snapshot = match state
-        .materialize_authorized_snapshot(tenant, entity_type, key_str, authz_snapshot)
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return odata_error(
-                if matches!(error, DispatchError::Conflict(_)) {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                },
-                "AuthorizationStateChanged",
-                &error.to_string(),
-            )
-            .into_response();
-        }
-    };
-    let current_state = snapshot.current_state;
+    let current_state = authz_snapshot.current_state;
     let expected_authorization_precondition =
         crate::entity_actor::effects::entity_authorization_precondition(&current_state.state);
 
@@ -333,7 +303,7 @@ pub(super) async fn dispatch_bound_action(
     }
 
     let result = state
-        .dispatch_tenant_action_ext_typed_if_current(
+        .dispatch_bound_action_if_current(
             DispatchCommand {
                 tenant,
                 entity_type,
@@ -412,6 +382,11 @@ pub(super) async fn dispatch_bound_action(
                 )
                 .into_response()
             }
+        }
+        Err(error @ DispatchError::NotFound(_)) => {
+            http_span.set_status(Status::error(error.to_string()));
+            http_span.set_attribute(OtelKeyValue::new("http.status_code", 404i64));
+            odata_error(StatusCode::NOT_FOUND, "EntityNotFound", &error.to_string()).into_response()
         }
         Err(DispatchError::Ungoverned(entity)) => {
             let reason = format!(

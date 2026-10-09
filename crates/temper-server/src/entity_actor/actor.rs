@@ -48,6 +48,7 @@ pub(super) enum ReplayPolicy {
     LenientSnapshot,
     StrictSnapshot,
     StrictFullJournal,
+    ExistingSnapshot,
 }
 
 /// How far a replay goes (ADR-0182).
@@ -67,8 +68,26 @@ impl ReplayPolicy {
         self != Self::LenientSnapshot
     }
 
-    fn strict_event_validation(self) -> bool {
-        self == Self::StrictFullJournal
+    fn strict_journal_integrity(self) -> bool {
+        matches!(self, Self::StrictFullJournal | Self::ExistingSnapshot)
+    }
+
+    fn validate_entity_event(
+        self,
+        table: &TransitionTable,
+        state: &EntityState,
+        envelope: &PersistenceEnvelope,
+        event: &EntityEvent,
+    ) -> Result<(), ActorError> {
+        match self {
+            Self::ExistingSnapshot => {
+                super::replay_validation::validate_entity_event_integrity(state, envelope, event)
+            }
+            Self::StrictFullJournal => super::replay_validation::validate_strict_entity_event(
+                table, state, envelope, event,
+            ),
+            Self::LenientSnapshot | Self::StrictSnapshot => Ok(()),
+        }
     }
 }
 
@@ -118,6 +137,8 @@ pub struct EntityActor {
     /// Object store for field-overflow blob bytes. SQL stores only refs.
     pub(super) blob_store: Option<crate::blob_store::BlobStore>,
     legacy_blob_store: Option<Arc<dyn crate::storage::BlobStore>>,
+    /// External admission may recover an entity, but must never bootstrap it.
+    existing_only: bool,
 }
 
 impl EntityActor {
@@ -253,6 +274,7 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            existing_only: false,
         }
     }
 
@@ -278,7 +300,14 @@ impl EntityActor {
             idempotency_cache: None,
             blob_store: None,
             legacy_blob_store: None,
+            existing_only: false,
         }
+    }
+
+    /// Forbid bootstrap, including when supervision restarts this actor.
+    pub(crate) fn existing_only(mut self) -> Self {
+        self.existing_only = true;
+        self
     }
 
     /// Set the tenant for this actor (must be called before spawning).
@@ -567,6 +596,10 @@ impl EntityActor {
                             seq = snapshot_seq,
                             "loaded snapshot before replay"
                         );
+                    } else if replay_policy == ReplayPolicy::ExistingSnapshot {
+                        return Err(ActorError::custom(
+                            "invalid entity snapshot during bound-action admission",
+                        ));
                     } else {
                         tracing::warn!(
                             entity = %state.entity_id,
@@ -576,6 +609,11 @@ impl EntityActor {
                     }
                 }
                 Ok(None) => {}
+                Err(e) if replay_policy == ReplayPolicy::ExistingSnapshot => {
+                    return Err(ActorError::custom(format!(
+                        "failed to load entity snapshot: {e}"
+                    )));
+                }
                 Err(e) => {
                     tracing::warn!(
                         entity = %state.entity_id,
@@ -611,7 +649,7 @@ impl EntityActor {
                 }
                 let mut expected_sequence = from_sequence.saturating_add(1);
                 for (index, env) in envelopes.iter().enumerate() {
-                    if replay_policy.strict_event_validation() {
+                    if replay_policy.strict_journal_integrity() {
                         if env.sequence_nr != expected_sequence {
                             return Err(ActorError::custom(format!(
                                 "non-contiguous journal for {}:{}: expected sequence {}, found {}",
@@ -639,7 +677,7 @@ impl EntityActor {
                     }
 
                     if env.event_type == COMPOSITE_EVENT_TYPE {
-                        if replay_policy.strict_event_validation() {
+                        if replay_policy.strict_journal_integrity() {
                             super::replay_validation::validate_strict_composite_event(
                                 tenant, state, env,
                             )?;
@@ -655,17 +693,13 @@ impl EntityActor {
                     if env.event_type == "Deleted" {
                         let tombstone = match parsed_event {
                             Ok(mut event) => {
-                                if replay_policy.strict_event_validation() {
-                                    super::replay_validation::validate_strict_entity_event(
-                                        table, state, env, &event,
-                                    )?;
-                                }
+                                replay_policy.validate_entity_event(table, state, env, &event)?;
                                 event.params =
                                     super::effects::sanitize_action_params(&event.params)
                                         .into_owned();
                                 event
                             }
-                            Err(error) if replay_policy.strict_event_validation() => {
+                            Err(error) if replay_policy.strict_journal_integrity() => {
                                 return Err(ActorError::custom(format!(
                                     "invalid tombstone event for {}:{} at sequence {}: {error}",
                                     state.entity_type, state.entity_id, env.sequence_nr
@@ -692,7 +726,8 @@ impl EntityActor {
                         }
                         state.push_event_bounded(tombstone);
                         state.sequence_nr = env.sequence_nr;
-                        if replay_policy.strict_event_validation() && index + 1 != envelopes.len() {
+                        if replay_policy.strict_journal_integrity() && index + 1 != envelopes.len()
+                        {
                             return Err(ActorError::custom(format!(
                                 "journal for {}:{} contains events after terminal tombstone at sequence {}",
                                 state.entity_type, state.entity_id, env.sequence_nr
@@ -723,7 +758,7 @@ impl EntityActor {
                                     // predates the live guard. It is as dropped as
                                     // one that failed to deserialize, so it fails
                                     // or counts the same way.
-                                    if replay_policy.strict_event_validation() {
+                                    if replay_policy.strict_journal_integrity() {
                                         return Err(ActorError::custom(format!(
                                             "non-object field-update event for {}:{} at sequence {}",
                                             state.entity_type, state.entity_id, env.sequence_nr
@@ -745,7 +780,7 @@ impl EntityActor {
                                 // dropping a field update there can preserve
                                 // exactly the authority a `FieldsReplaced` was
                                 // meant to revoke. Fail instead of skipping.
-                                if replay_policy.strict_event_validation() {
+                                if replay_policy.strict_journal_integrity() {
                                     return Err(ActorError::custom(format!(
                                         "invalid field-update event for {}:{} at sequence {}: {e}",
                                         state.entity_type, state.entity_id, env.sequence_nr
@@ -771,11 +806,7 @@ impl EntityActor {
 
                     match parsed_event {
                         Ok(mut event) => {
-                            if replay_policy.strict_event_validation() {
-                                super::replay_validation::validate_strict_entity_event(
-                                    table, state, env, &event,
-                                )?;
-                            }
+                            replay_policy.validate_entity_event(table, state, env, &event)?;
                             let frozen_bootstrap = event.action == "Created"
                                 && event.from_status.is_empty()
                                 && env.payload.get("initial_values").is_some();
@@ -862,7 +893,7 @@ impl EntityActor {
                             state.push_event_bounded(event);
                         }
                         Err(e) => {
-                            if replay_policy.strict_event_validation() {
+                            if replay_policy.strict_journal_integrity() {
                                 return Err(ActorError::custom(format!(
                                     "invalid event for {}:{} at sequence {}: {e}",
                                     state.entity_type, state.entity_id, env.sequence_nr
@@ -1026,6 +1057,26 @@ impl Actor for EntityActor {
             &self.initial_fields,
         );
 
+        if self.existing_only {
+            let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
+            else {
+                return Err(ActorError::custom(
+                    "existing-only startup requires a journal",
+                ));
+            };
+            return super::admission::recover_existing_state(
+                &self.tenant,
+                &self.entity_type,
+                &self.entity_id,
+                &table,
+                store,
+                backend,
+                self.blob_store.as_ref(),
+            )
+            .await?
+            .ok_or_else(|| ActorError::custom("entity disappeared during bound-action admission"));
+        }
+
         // Replay events from Postgres to rebuild state (if persistence is configured).
         // Re-evaluates each event through the TransitionTable to reconstruct
         // all state variables (status, counters, booleans) — not just item_count.
@@ -1181,8 +1232,8 @@ impl Actor for EntityActor {
                     return Ok(());
                 }
 
-                if let Some(expected) = expected_authorization_precondition
-                    && super::effects::entity_authorization_precondition(state) != expected
+                if let Some(expected) = expected_authorization_precondition.as_ref()
+                    && &super::effects::entity_authorization_precondition(state) != expected
                 {
                     ctx.reply(EntityResponse {
                         success: false,
@@ -1390,9 +1441,11 @@ impl Actor for EntityActor {
                                         state,
                                         &self.tenant,
                                         self.blob_store.as_ref(),
-                                        // Actor hydration keeps the lenient "start
-                                        // fresh on read error" behavior (unchanged).
-                                        ReplayPolicy::LenientSnapshot,
+                                        if expected_authorization_precondition.is_some() {
+                                            ReplayPolicy::ExistingSnapshot
+                                        } else {
+                                            ReplayPolicy::LenientSnapshot
+                                        },
                                     )
                                     .await?;
 
@@ -1435,6 +1488,22 @@ impl Actor for EntityActor {
                                             .await;
                                         ctx.reply(response);
                                         return Ok(());
+                                    }
+
+                                    // A raced deletion or update invalidates the Cedar
+                                    // decision too. Never retry against new authority.
+                                    if expected_authorization_precondition.as_ref().is_some_and(
+                                        |expected| {
+                                            &super::effects::entity_authorization_precondition(
+                                                state,
+                                            ) != expected
+                                        },
+                                    ) {
+                                        retry_final = Some((
+                                            crate::runtime_metrics::ConcurrencyRetryOutcome::ActionIllegal,
+                                            Some("action authorization became stale; retry against current state".into()),
+                                        ));
+                                        break;
                                     }
 
                                     // Re-evaluate the action against the caught-up

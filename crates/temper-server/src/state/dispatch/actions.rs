@@ -32,6 +32,22 @@ fn truncate_request_body_for_log(serialized: &str) -> String {
 }
 
 impl crate::state::ServerState {
+    /// Internal dispatch retains intentional get-or-create actor admission.
+    pub(crate) async fn dispatch_tenant_action_with_completion(
+        &self,
+        cmd: DispatchCommand<'_>,
+        expected_authorization_precondition: Option<String>,
+        reaction_depth: Option<u32>,
+    ) -> Result<CompletionResult, DispatchError> {
+        self.dispatch_action_on_actor(
+            cmd,
+            expected_authorization_precondition,
+            reaction_depth,
+            None,
+        )
+        .await
+    }
+
     /// Authorized actor dispatch followed by its registered completion scope.
     /// Historical replies never infer a fresh reaction obligation.
     #[instrument(skip_all, fields(
@@ -51,11 +67,12 @@ impl crate::state::ServerState {
         success = tracing::field::Empty,
         error_msg = tracing::field::Empty,
     ))]
-    pub(crate) async fn dispatch_tenant_action_with_completion(
+    pub(super) async fn dispatch_action_on_actor(
         &self,
         cmd: DispatchCommand<'_>,
         expected_authorization_precondition: Option<String>,
         reaction_depth: Option<u32>,
+        admitted_actor: Option<temper_runtime::actor::ActorRef<EntityMsg>>,
     ) -> Result<CompletionResult, DispatchError> {
         let DispatchCommand {
             tenant,
@@ -138,7 +155,10 @@ impl crate::state::ServerState {
         // Entry points retain their authorization boundary. Invalid first inputs
         // must not materialize an actor; existing actors validate hydrated state.
         let table = self.transition_table_for_dispatch(tenant, entity_type)?;
-        if table.has_input_contracts() && !self.entity_exists(tenant, entity_type, entity_id) {
+        if admitted_actor.is_none()
+            && table.has_input_contracts()
+            && !self.entity_exists(tenant, entity_type, entity_id)
+        {
             let snapshot = self
                 .load_authz_resource_snapshot(tenant, entity_type, entity_id)
                 .await
@@ -192,7 +212,9 @@ impl crate::state::ServerState {
                 .read()
                 .map(|reg| reg.contains_key(&actor_key))
                 .unwrap_or(false);
-            let Some(ar) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
+            let Some(ar) = admitted_actor
+                .or_else(|| self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id))
+            else {
                 return Err(DispatchError::Internal(format!(
                     "failed to resolve actor for governed entity type '{entity_type}'"
                 )));

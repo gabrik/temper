@@ -118,6 +118,47 @@ impl crate::state::ServerState {
         .await
     }
 
+    /// External HTTP admission pins a recovery-only actor. It cannot fall back
+    /// to bootstrap if deletion or passivation races with the Cedar check.
+    pub(crate) async fn dispatch_bound_action_if_current(
+        &self,
+        cmd: DispatchCommand<'_>,
+        expected_authorization_precondition: String,
+    ) -> Result<EntityResponse, DispatchError> {
+        if self
+            .composite_metadata_for(cmd.tenant, cmd.entity_type, cmd.action)?
+            .is_some()
+        {
+            self.reject_action_supplied_sub_writes(cmd.entity_type, cmd.action, &cmd.params)?;
+        }
+        let actor = self
+            .admit_bound_action(cmd.tenant, cmd.entity_type, cmd.entity_id)
+            .await?;
+        let (cmd_tenant, cmd_type, cmd_id) = (cmd.tenant, cmd.entity_type, cmd.entity_id);
+        let result = self
+            .dispatch_action_on_actor(
+                cmd,
+                Some(expected_authorization_precondition),
+                Some(0),
+                Some(actor.clone()),
+            )
+            .await
+            .map(|result| result.response);
+        if result.is_err() && actor.is_closed() {
+            self.remove_failed_bound_actor(&actor);
+            // Startup can lose a race to deletion. Classify from authority,
+            // never from an opaque stopped/init-failed actor error.
+            let snapshot = self
+                .load_bound_action_snapshot(cmd_tenant, cmd_type, cmd_id)
+                .await
+                .map_err(DispatchError::Internal)?;
+            if !snapshot.exists {
+                return Err(DispatchError::NotFound(format!("{cmd_type}:{cmd_id}")));
+            }
+        }
+        result
+    }
+
     /// Dispatch an externally authorized action only if the target actor still
     /// matches the exact local state used for the Cedar decision.
     #[instrument(skip_all, fields(

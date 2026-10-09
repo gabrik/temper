@@ -138,6 +138,10 @@ pub enum DispatchError {
     #[error("entity type '{0}' is not governed by any registered spec")]
     Ungoverned(String),
 
+    /// An authorized external action targeted an absent or deleted entity.
+    #[error("entity '{0}' was not found")]
+    NotFound(String),
+
     /// An internal error (serialization, persistence, unexpected state).
     #[error("{0}")]
     Internal(String),
