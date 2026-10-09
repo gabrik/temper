@@ -5,7 +5,9 @@
 //! HTTP 503 — never as 401 (invalid credential), 404 (absent record), nor
 //! silently as an anonymous/protocol-forwarded request. Genuinely missing,
 //! revoked, expired, malformed, or wrong-tenant credentials must remain
-//! denied exactly as before (401/403/404).
+//! denied exactly as before (401/403/404) — including a tenant with no
+//! identity governance installed at all, which is a configuration state,
+//! not an outage (see `ungoverned_tenant_falls_through_to_401_not_503`).
 //!
 //! All fixtures are in-memory/Sim (`temper_store_sim::SimEventStore`); no
 //! `DATABASE_URL`, no Postgres, no Docker, no testcontainers.
@@ -29,7 +31,7 @@ const TENANT: &str = "identity-dependency-test";
 /// A second, independently governed tenant (also bootstrapped with agent
 /// specs) used only to prove cross-tenant denial stays 401 — distinct from
 /// a tenant that was never bootstrapped at all (see
-/// `missing_governing_transition_table_is_503_not_401`).
+/// `ungoverned_tenant_falls_through_to_401_not_503`).
 const OTHER_GOVERNED_TENANT: &str = "identity-dependency-test-other-tenant";
 
 const POLICY: &str = r#"
@@ -203,9 +205,10 @@ async fn revoked_credential_remains_401_not_503() {
 
 /// A credential presented against a different, equally-governed tenant
 /// remains denied (401) — this is a confirmed absence (the credential was
-/// never issued there), not a dependency failure. Distinct from a tenant
-/// with no governance at all, which is `Unavailable` (503); see
-/// `missing_governing_transition_table_is_503_not_401`.
+/// never issued there), not a dependency failure. Distinct from, but with
+/// the same outcome as, a tenant with no governance at all — see
+/// `ungoverned_tenant_falls_through_to_401_not_503`: both are configuration
+/// states, not outages.
 #[tokio::test]
 async fn wrong_tenant_credential_remains_401_not_503() {
     let (state, _sim_store) = dependency_test_state().await;
@@ -252,6 +255,46 @@ async fn never_registered_token_remains_401_not_503() {
         response.status(),
         StatusCode::UNAUTHORIZED,
         "a token that was never registered is a confirmed absence, not a dependency failure"
+    );
+}
+
+/// A tenant with no governing transition table for `AgentCredential` at all
+/// (never bootstrapped with agent specs) is a configuration state — identity
+/// governance was never installed there — not an outage. It must fall
+/// through exactly like any other confirmed-absent credential: 401, not 503.
+///
+/// This inverts the contract this suite originally shipped with (CI caught
+/// the error: `crates/temper-platform/src/bearer_auth/tests.rs` fixtures
+/// that never call `bootstrap_agent_specs` — `PlatformState::new(None)` with
+/// no bootstrap at all — hit exactly this path and got 503 instead of their
+/// expected 200/401). Only genuine infrastructure failures (store/journal
+/// read or replay errors, actor-ask failures, a poisoned registry lock)
+/// remain `Unavailable` → 503; see `credential_replay_failure_is_503_not_401`,
+/// `linked_agent_type_replay_failure_is_503_not_401`,
+/// `both_credential_reads_faulted_is_503_not_401`, and
+/// `poisoned_registry_lock_is_503_not_401` below for those.
+#[tokio::test]
+async fn ungoverned_tenant_falls_through_to_401_not_503() {
+    let (state, _sim_store) = dependency_test_state().await;
+    // "ungoverned-tenant" never ran `bootstrap_agent_specs`, so it has no
+    // AgentCredential/AgentType transition table at all.
+    let app = temper_platform::router::build_platform_router(state);
+    let response = app
+        .oneshot(
+            Request::get("/tdata/AgentTypes")
+                .header("Authorization", "Bearer tmpr_whatever")
+                .header("X-Tenant-Id", "ungoverned-tenant")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a tenant with identity governance not installed is a configuration \
+         state, not a dependency outage — it must fall through to the \
+         pre-existing denial path (401), never become 503"
     );
 }
 
@@ -416,34 +459,6 @@ async fn poisoned_registry_lock_is_503_not_401() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a poisoned spec-registry lock must fail closed as a dependency \
          failure (503), never as an invalid credential (401)"
-    );
-}
-
-/// A tenant with no governing transition table for `AgentCredential` (never
-/// bootstrapped with agent specs) must surface as 503, not 401 — missing
-/// governance is a deliberate dependency-unavailable classification, not a
-/// silently absent credential.
-#[tokio::test]
-async fn missing_governing_transition_table_is_503_not_401() {
-    let (state, _sim_store) = dependency_test_state().await;
-    // "ungoverned-tenant" never ran `bootstrap_agent_specs`, so it has no
-    // AgentCredential/AgentType transition table at all.
-    let app = temper_platform::router::build_platform_router(state);
-    let response = app
-        .oneshot(
-            Request::get("/tdata/AgentTypes")
-                .header("Authorization", "Bearer tmpr_whatever")
-                .header("X-Tenant-Id", "ungoverned-tenant")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "an ungoverned tenant must fail closed as a dependency failure (503), \
-         never as an invalid credential (401)"
     );
 }
 

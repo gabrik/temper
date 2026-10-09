@@ -42,11 +42,17 @@ pub(super) fn require_field<'a>(
 /// from a confirmed-absent record.
 ///
 /// `Ok(None)` means the read succeeded and the entity genuinely does not
-/// exist (zero events). `Err` means the read itself could not be completed
-/// — a poisoned spec-registry lock, a governing transition table that is
-/// missing for this tenant/entity type, or a journal replay failure — and
-/// must never be classified as an absent or invalid credential; callers
-/// route it through [`classify_dependency_read`] to enforce that.
+/// exist — either zero events, or the tenant has no governing transition
+/// table for this entity type at all. The latter is a configuration state
+/// (identity governance not installed for this tenant/deployment), not an
+/// outage: it must fall through exactly like a confirmed-absent record, the
+/// same way the ask-path's `entity_exists` guards already treat an
+/// unindexed entity in an ungoverned tenant as absent (see
+/// `IdentityResolver::resolve_jwt`/`current_generation`). `Err` means the
+/// read itself could not be completed for a genuine infrastructure reason —
+/// a poisoned spec-registry lock or a journal replay failure — and must
+/// never be classified as an absent or invalid credential; callers route it
+/// through [`classify_dependency_read`] to enforce that.
 pub(super) async fn authoritative_entity_state(
     state: &ServerState,
     tenant: &TenantId,
@@ -54,16 +60,34 @@ pub(super) async fn authoritative_entity_state(
     entity_id: &str,
 ) -> Result<Option<EntityState>, String> {
     let Some((store, backend)) = state.event_journal() else {
+        // In-memory (no-journal) deployments route through the actor-ask
+        // path, which spawns an actor from the governing transition table.
+        // That spawn fails with a generic "no transition table" error
+        // indistinguishable, as a string, from a real actor-ask failure —
+        // so the governance check is done directly here, the same way the
+        // journal branch below checks it, before ever asking the actor.
+        let governed = {
+            let registry = state
+                .registry
+                .read()
+                .map_err(|_| "spec registry lock poisoned".to_string())?;
+            registry.get_table(tenant, entity_type).is_some()
+        };
+        if !governed {
+            return Ok(None);
+        }
         return state
             .get_tenant_entity_state(tenant, entity_type, entity_id)
             .await
             .map(|response| Some(response.state));
     };
 
-    // A poisoned registry lock or a missing governing transition table are
-    // the registry's own unavailability — deliberately classified here as a
-    // dependency failure, never silently folded into "credential does not
-    // exist".
+    // A poisoned registry lock is the registry's own unavailability — a
+    // genuine infrastructure failure, deliberately classified as a
+    // dependency failure. A missing governing transition table is not: it
+    // means identity governance was never installed for this tenant, a
+    // configuration state indistinguishable from "this credential does not
+    // exist here", so it falls through as a confirmed absence below.
     let table = {
         let registry = state
             .registry
@@ -72,9 +96,7 @@ pub(super) async fn authoritative_entity_state(
         registry.get_table(tenant, entity_type)
     };
     let Some(table) = table else {
-        return Err(format!(
-            "no governing transition table for tenant '{tenant}' entity type '{entity_type}'"
-        ));
+        return Ok(None);
     };
     let initial_fields = serde_json::json!({});
     match recover_authoritative_entity_state_from_store(
