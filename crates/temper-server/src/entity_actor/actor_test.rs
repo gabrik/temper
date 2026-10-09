@@ -461,7 +461,12 @@ fn snapshot_restore_canonicalizes_runtime_owned_fields() {
     });
     let bytes = serde_json::to_vec(&snapshot).expect("snapshot serialization");
 
-    assert!(EntityActor::apply_snapshot_bytes(&mut state, 7, &bytes));
+    assert!(EntityActor::apply_snapshot_bytes(
+        &mut state,
+        &TransitionTable::from_ioa_source(ORDER_IOA),
+        7,
+        &bytes
+    ));
     assert_eq!(state.fields["Id"], "order-snapshot");
     assert_eq!(state.fields["id"], "order-snapshot");
     assert_eq!(state.fields["Status"], "Draft");
@@ -1886,6 +1891,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
     let mut state = state_with(serde_json::json!({"Customer": "Alice", "Region": "eu"}));
     assert!(crate::entity_actor::effects::apply_field_update(
         &mut state,
+        &TransitionTable::from_ioa_source(ORDER_IOA),
         &serde_json::json!({"Customer": "Bob"}),
         false,
     ));
@@ -1899,6 +1905,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
     let mut state = state_with(serde_json::json!({"Customer": "Alice", "Region": "eu"}));
     assert!(crate::entity_actor::effects::apply_field_update(
         &mut state,
+        &TransitionTable::from_ioa_source(ORDER_IOA),
         &serde_json::json!({"Customer": "Bob"}),
         true,
     ));
@@ -1915,6 +1922,7 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
         let mut state = state_with(serde_json::json!({"Customer": "Alice"}));
         assert!(crate::entity_actor::effects::apply_field_update(
             &mut state,
+            &TransitionTable::from_ioa_source(ORDER_IOA),
             &serde_json::json!({
                 "Id": "forged",
                 "Status": "Delivered",
@@ -1937,11 +1945,17 @@ fn apply_field_update_merge_replace_and_runtime_owned_fields() {
     let mut state = state_with(serde_json::json!({"Customer": "Alice"}));
     let update = serde_json::json!({"Customer": "Bob"});
     assert!(crate::entity_actor::effects::apply_field_update(
-        &mut state, &update, false
+        &mut state,
+        &TransitionTable::from_ioa_source(ORDER_IOA),
+        &update,
+        false
     ));
     let once = state.fields.clone();
     assert!(crate::entity_actor::effects::apply_field_update(
-        &mut state, &update, false
+        &mut state,
+        &TransitionTable::from_ioa_source(ORDER_IOA),
+        &update,
+        false
     ));
     assert_eq!(state.fields, once, "re-applying an event must not drift");
 }
@@ -2344,7 +2358,12 @@ fn replaying_a_non_object_field_event_leaves_state_untouched() {
     ] {
         for replace in [true, false] {
             assert!(
-                !crate::entity_actor::effects::apply_field_update(&mut state, &payload, replace),
+                !crate::entity_actor::effects::apply_field_update(
+                    &mut state,
+                    &TransitionTable::from_ioa_source(ORDER_IOA),
+                    &payload,
+                    replace
+                ),
                 "a non-object payload must be declined, not applied"
             );
             assert_eq!(

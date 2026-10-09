@@ -9,6 +9,7 @@ mod actor;
 pub(crate) mod admission;
 pub(crate) mod bootstrap;
 pub mod effects;
+pub(crate) mod field_ownership;
 mod field_updates;
 mod replay_validation;
 pub mod sim_handler;

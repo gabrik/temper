@@ -19,6 +19,7 @@ mod storage_guardrails;
 mod stream_fast_path;
 mod stream_put;
 mod write;
+mod write_fields;
 
 pub(crate) use common::resolve_entity_type;
 pub use content_addressed::handle_blob_ingest_raw;

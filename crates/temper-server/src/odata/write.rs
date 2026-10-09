@@ -418,15 +418,13 @@ async fn authorize_existing_mutation(
         &snapshot.current_state.state,
     );
     Ok(ExistingMutationResource {
-        status: snapshot.current_state.state.status,
-        fields: snapshot.current_state.state.fields,
+        current: snapshot.current_state.state,
         precondition,
     })
 }
 
 struct ExistingMutationResource {
-    status: String,
-    fields: serde_json::Value,
+    current: crate::entity_actor::EntityState,
     precondition: String,
 }
 
@@ -547,6 +545,19 @@ pub async fn handle_odata_post(
                     Ok(prepared) => prepared,
                     Err(response) => return *response,
                 };
+            let initial_fields = match super::write_fields::create_fields(
+                &state,
+                &tenant,
+                &entity_type,
+                &entity_id,
+                initial_fields,
+            ) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error)
+                        .into_response();
+                }
+            };
             if let Err(resp) = authorize_collection_create(
                 &state,
                 &tenant,
@@ -1049,16 +1060,19 @@ pub async fn handle_odata_patch(
                 )
                 .into_response();
             }
-            let mut prospective_fields = existing.fields;
-            if let (Some(dst), Some(src)) =
-                (prospective_fields.as_object_mut(), body_json.as_object())
-            {
-                for (k, v) in src {
-                    dst.insert(k.clone(), v.clone());
+            let prospective_fields = match super::write_fields::prospective_fields(
+                &state,
+                &tenant,
+                existing.current.clone(),
+                &body_json,
+                false,
+            ) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error)
+                        .into_response();
                 }
-            } else {
-                prospective_fields = body_json.clone();
-            }
+            };
 
             if let Err(response) = authorize_prospective_mutation(
                 &state,
@@ -1066,7 +1080,7 @@ pub async fn handle_odata_patch(
                     tenant: &tenant,
                     entity_type: &entity_type,
                     entity_id: &key_str,
-                    status: &existing.status,
+                    status: &existing.current.status,
                     fields: &prospective_fields,
                     security_ctx: &security_ctx,
                     agent_ctx: &agent_ctx,
@@ -1271,14 +1285,28 @@ pub async fn handle_odata_put(
                 .into_response();
             }
 
+            let prospective_fields = match super::write_fields::prospective_fields(
+                &state,
+                &tenant,
+                existing.current.clone(),
+                &body_json,
+                true,
+            ) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "ReadError", &error)
+                        .into_response();
+                }
+            };
+
             if let Err(response) = authorize_prospective_mutation(
                 &state,
                 ProspectiveMutationAuthorization {
                     tenant: &tenant,
                     entity_type: &entity_type,
                     entity_id: &key_str,
-                    status: &existing.status,
-                    fields: &body_json,
+                    status: &existing.current.status,
+                    fields: &prospective_fields,
                     security_ctx: &security_ctx,
                     agent_ctx: &agent_ctx,
                 },
@@ -1297,7 +1325,7 @@ pub async fn handle_odata_put(
                 &key_str,
                 "Put",
                 "put",
-                &body_json,
+                &prospective_fields,
             )
             .await
             {
@@ -1308,7 +1336,7 @@ pub async fn handle_odata_put(
                 &state,
                 &tenant,
                 &entity_type,
-                &body_json,
+                &prospective_fields,
             )
             .await
             {
@@ -1320,7 +1348,7 @@ pub async fn handle_odata_put(
                 &tenant,
                 &entity_type,
                 &key_str,
-                &body_json,
+                &prospective_fields,
             )
             .await
             {
@@ -1331,7 +1359,7 @@ pub async fn handle_odata_put(
                 &state,
                 &tenant,
                 &entity_type,
-                owner_id_from_fields(&body_json),
+                owner_id_from_fields(&prospective_fields),
                 &security_ctx,
                 &agent_ctx,
             )
@@ -1490,7 +1518,7 @@ pub async fn handle_odata_delete(
                 &key_str,
                 "Delete",
                 "delete",
-                &existing.fields,
+                &existing.current.fields,
             )
             .await
             {
@@ -1501,7 +1529,7 @@ pub async fn handle_odata_delete(
                 &state,
                 &tenant,
                 &entity_type,
-                &existing.fields,
+                &existing.current.fields,
             )
             .await
             {
@@ -1512,7 +1540,7 @@ pub async fn handle_odata_delete(
                 &state,
                 &tenant,
                 &entity_type,
-                owner_id_from_fields(&existing.fields),
+                owner_id_from_fields(&existing.current.fields),
                 &security_ctx,
                 &agent_ctx,
             )

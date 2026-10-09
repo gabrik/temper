@@ -154,7 +154,7 @@ impl EntityActor {
         table.initialize_declared_fields(&mut fields, &mut counters, &mut booleans);
         super::effects::canonicalize_entity_fields(&mut fields, entity_id, &table.initial_state);
 
-        EntityState {
+        let mut state = EntityState {
             entity_type: entity_type.to_string(),
             entity_id: entity_id.to_string(),
             status: table.initial_state.clone(),
@@ -173,7 +173,9 @@ impl EntityActor {
             last_snapshot_sequence_nr: 0,
             sequence_nr: 0,
             processed_idempotency_keys: BTreeMap::new(),
-        }
+        };
+        super::field_ownership::normalize(&mut state, table);
+        state
     }
 
     /// Snapshot frequency in events.
@@ -209,7 +211,12 @@ impl EntityActor {
     }
 
     /// Attempt to load actor state from snapshot payload bytes.
-    fn apply_snapshot_bytes(state: &mut EntityState, sequence_nr: u64, bytes: &[u8]) -> bool {
+    fn apply_snapshot_bytes(
+        state: &mut EntityState,
+        table: &TransitionTable,
+        sequence_nr: u64,
+        bytes: &[u8],
+    ) -> bool {
         let mut value = match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(v) => v,
             Err(_) => return false,
@@ -239,11 +246,7 @@ impl EntityActor {
                 {
                     return false;
                 }
-                super::effects::canonicalize_entity_fields(
-                    &mut restored.fields,
-                    &state.entity_id,
-                    &restored.status,
-                );
+                super::field_ownership::normalize(&mut restored, table);
                 restored.sequence_nr = sequence_nr;
                 restored.events_since_snapshot = 0;
                 restored.last_snapshot_sequence_nr = sequence_nr;
@@ -386,8 +389,11 @@ impl EntityActor {
         state: &mut EntityState,
         event: &EntityEvent,
     ) -> Result<u64, PersistenceError> {
-        let payload = super::bootstrap::event_payload(event, state)
-            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+        let payload = {
+            let table = self.table.read().expect("table lock poisoned");
+            super::bootstrap::event_payload(event, state, &table)
+                .map_err(|e| PersistenceError::Serialization(e.to_string()))?
+        };
         let envelope = PersistenceEnvelope {
             sequence_nr: state.sequence_nr + 1,
             event_type: event.action.clone(),
@@ -588,7 +594,7 @@ impl EntityActor {
         if replay_policy.loads_snapshot() {
             match store.load_snapshot(persistence_id).await {
                 Ok(Some((snapshot_seq, snapshot_bytes))) => {
-                    if Self::apply_snapshot_bytes(state, snapshot_seq, &snapshot_bytes) {
+                    if Self::apply_snapshot_bytes(state, table, snapshot_seq, &snapshot_bytes) {
                         from_sequence = snapshot_seq;
                         loaded_snapshot = true;
                         tracing::info!(
@@ -749,6 +755,7 @@ impl EntityActor {
                             Ok(event) => {
                                 let applied = super::effects::apply_field_update(
                                     state,
+                                    table,
                                     &event.params,
                                     env.event_type == super::effects::FIELDS_REPLACED_EVENT,
                                 );
@@ -816,7 +823,7 @@ impl EntityActor {
                                         "initial values require the first bootstrap event",
                                     ));
                                 }
-                                super::bootstrap::restore(state, &env.payload)?;
+                                super::bootstrap::restore(state, table, &env.payload)?;
                             }
                             event.params =
                                 super::effects::sanitize_action_params(&event.params).into_owned();
@@ -871,6 +878,9 @@ impl EntityActor {
                                     Some(&table.state_var_metadata),
                                 )
                             };
+                            // Match live post-action projection and snapshot restoration,
+                            // including legacy bootstrap fields without initial_values.
+                            super::field_ownership::normalize(state, table);
                             // Persist replayed overflow blobs so blob-ref envelopes
                             // resolve on subsequent OData reads. Content-addressed
                             // dedup makes this idempotent — if the original live
@@ -1099,7 +1109,7 @@ impl Actor for EntityActor {
         // fields are durable and replayable.
         if self.event_journal.is_some() && state.sequence_nr == 0 && state.total_event_count == 0 {
             let initial_params =
-                super::effects::sanitize_action_params(&self.initial_fields).into_owned();
+                super::field_ownership::sanitize(&state, &table, &self.initial_fields);
             let created = EntityEvent {
                 action: "Created".to_string(),
                 from_status: String::new(),
@@ -1988,3 +1998,7 @@ mod authoritative_replay_tests;
 #[cfg(test)]
 #[path = "contract_state_test.rs"]
 pub(super) mod contract_state_tests;
+
+#[cfg(test)]
+#[path = "field_ownership_test.rs"]
+mod field_ownership_tests;

@@ -1304,10 +1304,10 @@ impl ServerState {
         };
 
         let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
-        let initial_fields =
-            crate::entity_actor::effects::sanitize_action_params(&initial_fields).into_owned();
         let mut state =
             EntityActor::build_initial_state(entity_type, entity_id, &table, &initial_fields);
+        let initial_fields =
+            crate::entity_actor::field_ownership::sanitize(&state, &table, &initial_fields);
 
         let created = EntityEvent {
             action: "Created".to_string(),
@@ -1320,7 +1320,7 @@ impl ServerState {
             idempotency_result: None,
             idempotency_reply: None,
         };
-        let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
+        let payload = crate::entity_actor::bootstrap::event_payload(&created, &state, &table)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;
         let envelope = PersistenceEnvelope {
             sequence_nr: 1,
