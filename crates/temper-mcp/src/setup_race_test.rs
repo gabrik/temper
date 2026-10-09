@@ -107,13 +107,16 @@ async fn check_race(credential: bool, conflict: bool, compatible: bool) {
         admin.ensure_type().await
     };
     proxy.abort();
-    assert_eq!(
-        race.reads.load(Ordering::SeqCst),
-        if conflict { 2 } else { 1 }
-    );
+    // temper#529 V11: ordinary external collection POST is create-only, so
+    // the real (unmocked) backend now conflicts on this already-seeded id
+    // exactly like the mock does -- `conflict` only chooses WHICH layer
+    // (mock vs. real create-only boundary) produces the 409 the client
+    // reacts to, not WHETHER one happens. Both arms resume via the same
+    // 409 + re-GET fallback, so the read count no longer depends on it.
+    assert_eq!(race.reads.load(Ordering::SeqCst), 2);
     if compatible {
         result.unwrap();
-        let expected_actions = usize::from(!credential || !conflict);
+        let expected_actions = usize::from(!credential);
         assert_eq!(race.actions.load(Ordering::SeqCst), expected_actions);
         assert_eq!(
             fixture

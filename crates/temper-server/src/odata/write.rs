@@ -32,8 +32,8 @@ use super::stream_put::handle_stream_put;
 use crate::blobs::hydrate_blob_refs_for_tenant;
 use crate::request_context::{AgentContext, extract_agent_context, remote_parent_context};
 use crate::response::{ODataResponse, odata_error};
-use crate::state::ServerState;
 use crate::state::trajectory::{TrajectoryEntry, TrajectorySource};
+use crate::state::{CreateOnlyOutcome, ServerState};
 
 type ODataWriteError = Box<axum::response::Response>;
 
@@ -757,41 +757,16 @@ pub async fn handle_odata_post(
                 }
             }
 
+            // Ordinary external collection POST is create-only (temper#529
+            // V11): any existing history for this id, live or tombstoned,
+            // is a 409 conflict, never a 201 for the old object and never a
+            // resurrection. Internal get-or-create callers are unaffected
+            // (they do not go through this handler).
             match state
-                .try_create_data_only_tenant_entity(
-                    &tenant,
-                    &entity_type,
-                    &entity_id,
-                    initial_fields.clone(),
-                )
+                .create_tenant_entity_create_only(&tenant, &entity_type, &entity_id, initial_fields)
                 .await
             {
-                Ok(Some(response)) => {
-                    let mut state_json = serde_json::to_value(&response.state).unwrap_or_default();
-                    hydrate_blob_refs_for_tenant(&state, &tenant, &mut state_json).await;
-                    let body = annotate_entity(
-                        state_json,
-                        format!("$metadata#{name}/$entity"),
-                        Some(format!("{name}('{entity_id}')")),
-                    );
-                    return ODataResponse {
-                        status: StatusCode::CREATED,
-                        body,
-                    }
-                    .into_response();
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
-                        .into_response();
-                }
-            }
-
-            match state
-                .get_or_create_tenant_entity(&tenant, &entity_type, &entity_id, initial_fields)
-                .await
-            {
-                Ok(response) => {
+                Ok(CreateOnlyOutcome::Created(response)) => {
                     if entity_type == "RateLimit" {
                         state.clear_commons_rate_limit_cache();
                     }
@@ -809,6 +784,12 @@ pub async fn handle_odata_post(
                     }
                     .into_response()
                 }
+                Ok(CreateOnlyOutcome::Conflict) => odata_error(
+                    StatusCode::CONFLICT,
+                    "EntityAlreadyExists",
+                    &format!("{entity_type} '{entity_id}' already exists"),
+                )
+                .into_response(),
                 Err(e) => odata_error(StatusCode::INTERNAL_SERVER_ERROR, "CreateError", &e)
                     .into_response(),
             }
