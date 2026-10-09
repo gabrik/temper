@@ -221,15 +221,17 @@ fn resource_not_found_response(set_name: &str, key: &str) -> Response {
     .into_response()
 }
 
-/// The authoritative journal could not be read to validate an existing
-/// catalog row's freshness (temper#529 fresh point reads). A typed
-/// dependency failure, never a silent stale 200 and never a fabricated 404.
-fn journal_unavailable_response(set_name: &str, key: &str, error: &str) -> Response {
+/// The authoritative journal could not be read while serving a point read
+/// (temper#529: catalog freshness validation or hydration existence probe).
+/// A typed dependency failure, never a silent stale 200 and never a
+/// fabricated 404. `context` names the failed check for the structured log.
+fn journal_unavailable_response(set_name: &str, key: &str, context: &str, error: &str) -> Response {
     tracing::error!(
         entity_set = %set_name,
         entity_id = %key,
+        context = %context,
         %error,
-        "catalog freshness check failed; journal dependency unavailable"
+        "journal dependency unavailable during entity point read"
     );
     odata_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -260,13 +262,33 @@ pub(super) async fn load_existing_entity_descriptor_body(
         CatalogReadOutcome::Fresh(body) => return Ok(body),
         CatalogReadOutcome::FallbackToActor => {}
         CatalogReadOutcome::JournalUnavailable(error) => {
-            return Err(journal_unavailable_response(set_name, key, &error));
+            return Err(journal_unavailable_response(
+                set_name,
+                key,
+                "catalog freshness check",
+                &error,
+            ));
         }
     }
-    if !state.entity_exists(tenant, entity_type, key)
-        && !state.ensure_entity_loaded(tenant, entity_type, key).await
-    {
-        return Err(resource_not_found_response(set_name, key));
+    if !state.entity_exists(tenant, entity_type, key) {
+        // temper#529 P2 follow-up (issue #529): a journal read failure while
+        // hydrating a non-resident entity is not absence — it must surface
+        // as a typed dependency failure, never a fabricated 404.
+        match state
+            .ensure_entity_loaded_or_error(tenant, entity_type, key)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(resource_not_found_response(set_name, key)),
+            Err(error) => {
+                return Err(journal_unavailable_response(
+                    set_name,
+                    key,
+                    "hydration existence probe",
+                    &error,
+                ));
+            }
+        }
     }
     state
         .get_tenant_entity_state(tenant, entity_type, key)

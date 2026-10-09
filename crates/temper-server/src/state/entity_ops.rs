@@ -1938,50 +1938,94 @@ impl ServerState {
 
     /// Ensure an entity is present in memory by lazily hydrating from the
     /// event store when needed.
-    #[instrument(skip_all, fields(otel.name = "entity.ensure_entity_loaded", tenant = %tenant, entity_type, entity_id))]
+    ///
+    /// A journal read failure while probing an entity that is NOT already
+    /// resident collapses to `false` here — the same answer as genuine
+    /// absence — because every current caller of this `bool` form only
+    /// needs a yes/no answer and already treats `false` as "skip, this
+    /// doesn't exist" with no further distinction (temper#529 P2 follow-up,
+    /// issue #529). [`Self::ensure_entity_loaded_or_error`] is the
+    /// discriminating counterpart for callers — e.g. an OData point read —
+    /// that must turn a journal outage into a typed dependency failure
+    /// rather than a fabricated 404 for an entity that actually exists.
     pub async fn ensure_entity_loaded(
         &self,
         tenant: &TenantId,
         entity_type: &str,
         entity_id: &str,
     ) -> bool {
+        self.ensure_entity_loaded_or_error(tenant, entity_type, entity_id)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// [`Self::ensure_entity_loaded`], but distinguishing confirmed absence
+    /// (`Ok(false)`: zero history, a tombstone, or a hydrating actor that
+    /// could not be spawned or asked — an actor-fault class deliberately
+    /// not discriminated here) from an unreadable
+    /// journal (`Err`): a transient `EventStore::read_events` failure while
+    /// hydrating an entity that is not already resident must never be
+    /// reported the same way as a genuinely empty history, or a journal
+    /// outage fabricates a 404/`EntityNotFound` for an entity that exists
+    /// (temper#529 P2 follow-up, issue #529).
+    ///
+    /// An entity already resident in the index is unaffected by a journal
+    /// read failure here: the read is only a tombstone/freshness
+    /// double-check for an entity whose state is already held in memory, so
+    /// a transient fault keeps serving the resident actor (`Ok(true)`)
+    /// rather than surfacing a dependency error for data that is not being
+    /// read from the journal.
+    #[instrument(skip_all, fields(otel.name = "entity.ensure_entity_loaded", tenant = %tenant, entity_type, entity_id))]
+    pub async fn ensure_entity_loaded_or_error(
+        &self,
+        tenant: &TenantId,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool, String> {
         let persistence_id = format!("{tenant}:{entity_type}:{entity_id}");
         let journal = self.event_journal();
 
         if self.entity_exists(tenant, entity_type, entity_id) {
             let Some((store, _backend)) = journal.as_ref() else {
-                return true;
+                return Ok(true);
             };
 
             let events = match store.read_events(&persistence_id, 0).await {
                 Ok(events) if !events.is_empty() => events,
-                _ => return true,
+                _ => return Ok(true),
             };
 
             if events.last().is_some_and(is_deleted_envelope) {
                 self.remove_entity(tenant, entity_type, entity_id);
-                return false;
+                return Ok(false);
             }
 
-            return true;
+            return Ok(true);
         }
 
         let Some((store, _backend)) = journal.as_ref() else {
-            return false;
+            return Ok(false);
         };
 
         let events = match store.read_events(&persistence_id, 0).await {
-            Ok(events) if !events.is_empty() => events,
-            _ => return false,
+            Ok(events) => events,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read journal history for {entity_type}:{entity_id} during hydration: {error}"
+                ));
+            }
         };
+        if events.is_empty() {
+            return Ok(false);
+        }
 
         if events.last().is_some_and(is_deleted_envelope) {
             self.remove_entity(tenant, entity_type, entity_id);
-            return false;
+            return Ok(false);
         }
 
         let Some(actor_ref) = self.get_or_spawn_tenant_actor(tenant, entity_type, entity_id) else {
-            return false;
+            return Ok(false);
         };
 
         let policy = self.dispatch_retry_policy();
@@ -1995,12 +2039,12 @@ impl ServerState {
             Ok(response) if response.state.status == "Deleted" => {
                 let _ = actor_ref.stop();
                 self.remove_entity(tenant, entity_type, entity_id);
-                false
+                Ok(false)
             }
-            Ok(_) => true,
+            Ok(_) => Ok(true),
             Err(_) => {
                 self.remove_entity(tenant, entity_type, entity_id);
-                false
+                Ok(false)
             }
         }
     }
