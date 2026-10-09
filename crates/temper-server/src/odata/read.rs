@@ -26,7 +26,8 @@ use super::query_plane_read::{
     QueryPlaneReadBudget, QueryPlaneReadRequest, read_entity_set_from_query_plane,
 };
 use super::read_support::{
-    record_entity_set_not_found, resolve_entity_set_name, try_load_entity_body_from_catalog,
+    CatalogReadOutcome, record_entity_set_not_found, resolve_entity_set_name,
+    try_load_entity_body_from_catalog,
 };
 use super::response::annotate_entity;
 use super::stream_fast_path::try_file_stream_fast_path;
@@ -220,6 +221,24 @@ fn resource_not_found_response(set_name: &str, key: &str) -> Response {
     .into_response()
 }
 
+/// The authoritative journal could not be read to validate an existing
+/// catalog row's freshness (temper#529 fresh point reads). A typed
+/// dependency failure, never a silent stale 200 and never a fabricated 404.
+fn journal_unavailable_response(set_name: &str, key: &str, error: &str) -> Response {
+    tracing::error!(
+        entity_set = %set_name,
+        entity_id = %key,
+        %error,
+        "catalog freshness check failed; journal dependency unavailable"
+    );
+    odata_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "JournalUnavailable",
+        &format!("Entity '{set_name}' with key '{key}' could not be validated as current: {error}"),
+    )
+    .into_response()
+}
+
 pub(super) async fn load_existing_entity_descriptor_body(
     state: &ServerState,
     tenant: &TenantId,
@@ -228,11 +247,21 @@ pub(super) async fn load_existing_entity_descriptor_body(
     key: &str,
 ) -> Result<serde_json::Value, Response> {
     let prefer_catalog = state.query_plane_store().is_some();
-    if let Some(body) =
-        try_load_entity_body_from_catalog(state, tenant, entity_type, set_name, key, prefer_catalog)
-            .await
+    match try_load_entity_body_from_catalog(
+        state,
+        tenant,
+        entity_type,
+        set_name,
+        key,
+        prefer_catalog,
+    )
+    .await
     {
-        return Ok(body);
+        CatalogReadOutcome::Fresh(body) => return Ok(body),
+        CatalogReadOutcome::FallbackToActor => {}
+        CatalogReadOutcome::JournalUnavailable(error) => {
+            return Err(journal_unavailable_response(set_name, key, &error));
+        }
     }
     if !state.entity_exists(tenant, entity_type, key)
         && !state.ensure_entity_loaded(tenant, entity_type, key).await
