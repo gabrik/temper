@@ -157,6 +157,17 @@ pub(in crate::odata) struct QueryPlaneReadTelemetry {
 }
 
 impl QueryPlaneReadTelemetry {
+    /// Add scan work and per-materialization shadow budgets without changing
+    /// the page's strategy, coverage, projection metadata, or returned rows.
+    pub(super) fn add_scan_work(&mut self, other: &Self) {
+        self.candidate_count += other.candidate_count;
+        self.materialized_count += other.materialized_count;
+        self.catalog_shadow_check_budget += other.catalog_shadow_check_budget;
+        self.catalog_shadow_check_scheduled += other.catalog_shadow_check_scheduled;
+        self.pushdown_sparse_probe_count += other.pushdown_sparse_probe_count;
+        self.pushdown_page_count += other.pushdown_page_count;
+    }
+
     /// Record this read contract's telemetry onto the current OData span.
     pub(in crate::odata) fn record(&self, span: &Span) {
         span.record("filter_pushdown", self.filter_pushdown);

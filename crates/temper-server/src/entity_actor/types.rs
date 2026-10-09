@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use temper_runtime::actor::Message;
 
-// TigerStyle: Fixed resource budgets. No unbounded growth.
-// These are hard limits, not suggestions. Violations are assertion failures.
+// Runtime resource budgets. Domain counter constraints belong to the spec.
 
 /// Maximum unsnapshotted events an actor may replay/hot-hold before refusing new transitions.
 pub const MAX_EVENTS_SINCE_SNAPSHOT: usize = 10_000;
@@ -15,8 +14,6 @@ pub const MAX_EVENTS_SINCE_SNAPSHOT: usize = 10_000;
 pub const MAX_EVENTS_PER_ENTITY: usize = MAX_EVENTS_SINCE_SNAPSHOT;
 /// Default number of recent events retained in memory per entity.
 pub const RECENT_EVENTS_BUDGET_DEFAULT: usize = 50;
-/// Maximum items an entity can hold.
-pub const MAX_ITEMS_PER_ENTITY: usize = 1_000;
 /// Maximum durable idempotency keys retained per entity.
 pub const MAX_DURABLE_IDEMPOTENCY_KEYS_PER_ENTITY: usize = 1_000;
 
@@ -51,6 +48,8 @@ pub enum EntityMsg {
         /// Digest of the exact local state used for an external Cedar
         /// decision. Internal dispatches omit it.
         expected_authorization_precondition: Option<String>,
+        /// Trusted first caller boundary; never taken from action parameters.
+        reply_mode: crate::idempotency::ActionReplyMode,
     },
     /// Get the current entity state.
     GetState,
@@ -180,6 +179,21 @@ pub struct EntityEvent {
     /// Optional idempotency key that caused this transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Canonical request binding (`idempotency::request_binding`) of the
+    /// request that used `idempotency_key` (ADR-0182). Absent on legacy events,
+    /// which are verified from `action` + `params` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_binding: Option<String>,
+    /// Immutable execution provenance (ADR-0182, review correction 2): digest
+    /// of the post-commit logical state this keyed request produced. A
+    /// duplicate is answered with 200 only if the state rebuilt for it still
+    /// hashes to this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_result: Option<String>,
+    /// Versioned authority for a cold reply. Raw JSON intentionally tolerates
+    /// invalid/legacy proof during hydration; key reuse validates it fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_reply: Option<serde_json::Value>,
 }
 
 /// Default value for `spec_governed`: actions are spec-governed unless explicitly marked otherwise.

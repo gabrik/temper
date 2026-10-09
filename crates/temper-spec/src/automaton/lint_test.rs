@@ -280,3 +280,183 @@ params = ["title", "description", "plan_id"]
         "expected no bundle lint findings, got: {findings:?}"
     );
 }
+
+/// The `AdoptStatedRootCause` shape, reduced to its structure.
+///
+/// `Adopt` enters `Analyzed`, whose invariant asserts that `content_changed` is
+/// clear -- and it satisfies that invariant by *writing* `false`, not by having
+/// observed it. `Observe` is an input action legal in the same `Stale` state
+/// that writes `content_changed` from what it actually saw. So a concurrent
+/// observation's write is absorbed by a literal, and the entity lands in a
+/// state whose invariant claims currency that nothing established.
+const ABSORBING: &str = r#"
+[automaton]
+name = "Insight"
+states = ["Pending", "Stale", "Analyzed"]
+initial = "Pending"
+
+[[state]]
+name = "content_changed"
+type = "bool"
+initial = false
+
+[[state]]
+name = "has_verdict"
+type = "bool"
+initial = false
+
+[[action]]
+name = "Observe"
+kind = "input"
+from = ["Pending", "Stale"]
+params = ["Changed"]
+effect = ["content_changed = params.Changed"]
+
+[[action]]
+name = "Adopt"
+kind = "input"
+from = ["Pending", "Stale"]
+to = "Analyzed"
+effect = ["content_changed = false", "has_verdict = true"]
+
+[[invariant]]
+name = "AnalyzedMeansVerdictIsCurrent"
+assert = "status in ['Analyzed'] => has_verdict && !content_changed"
+"#;
+
+#[test]
+fn literal_write_absorbing_a_concurrent_observation_is_flagged() {
+    let automaton = parse_automaton(ABSORBING).expect("parses");
+    let findings = lint_automaton(&automaton);
+
+    let finding = findings
+        .iter()
+        .find(|f| f.code == "absorbing_effect")
+        .unwrap_or_else(|| panic!("expected an absorbing_effect finding, got: {findings:#?}"));
+
+    // The message has to name all three parties, because the fix is a choice
+    // between them: the absorbing action, the variable, and the writer whose
+    // write is lost. Naming only the action sends the reader hunting.
+    for needle in [
+        "Adopt",
+        "content_changed",
+        "Observe",
+        "AnalyzedMeansVerdictIsCurrent",
+    ] {
+        assert!(
+            finding.message.contains(needle),
+            "message should name {needle}: {}",
+            finding.message
+        );
+    }
+}
+
+#[test]
+fn a_literal_write_no_invariant_polices_is_not_flagged() {
+    // Same collision on `content_changed`, but nothing in `Analyzed` asserts
+    // anything about it, so overwriting it claims nothing and is just a write.
+    let src = ABSORBING.replace(
+        "assert = \"status in ['Analyzed'] => has_verdict && !content_changed\"",
+        "assert = \"status in ['Analyzed'] => has_verdict\"",
+    );
+    let automaton = parse_automaton(&src).expect("parses");
+    let findings = lint_automaton(&automaton);
+    assert!(
+        !findings.iter().any(|f| f.code == "absorbing_effect"),
+        "no invariant reads content_changed in Analyzed: {findings:#?}"
+    );
+}
+
+#[test]
+fn a_write_derived_from_params_is_not_flagged() {
+    // The remedy, asserted: carry the observation instead of asserting a
+    // literal, and there is nothing to absorb.
+    let src = ABSORBING.replace(
+        "\"content_changed = false\"",
+        "\"content_changed = params.Changed\"",
+    );
+    let src = src.replace(
+        "from = [\"Pending\", \"Stale\"]\nto = \"Analyzed\"\neffect",
+        "from = [\"Pending\", \"Stale\"]\nparams = [\"Changed\"]\nto = \"Analyzed\"\neffect",
+    );
+    let automaton = parse_automaton(&src).expect("parses");
+    let findings = lint_automaton(&automaton);
+    assert!(
+        !findings.iter().any(|f| f.code == "absorbing_effect"),
+        "a param-derived write absorbs nothing: {findings:#?}"
+    );
+}
+
+#[test]
+fn no_concurrent_writer_means_no_finding() {
+    // The other remedy: forbid the racing writer where the claim is made.
+    let src = ABSORBING.replace(
+        "from = [\"Pending\", \"Stale\"]\nparams = [\"Changed\"]",
+        "from = [\"Pending\"]\nparams = [\"Changed\"]",
+    );
+    let src = src.replace(
+        "from = [\"Pending\", \"Stale\"]\nto = \"Analyzed\"",
+        "from = [\"Stale\"]\nto = \"Analyzed\"",
+    );
+    let automaton = parse_automaton(&src).expect("parses");
+    let findings = lint_automaton(&automaton);
+    assert!(
+        !findings.iter().any(|f| f.code == "absorbing_effect"),
+        "Observe is not legal in Stale, so nothing races Adopt: {findings:#?}"
+    );
+}
+
+#[test]
+fn alternative_outcomes_of_one_operation_are_not_flagged() {
+    // The success/failure callback pair, which is not a race: whichever fires
+    // leaves `Stale`, so the other's precondition is gone and the two writes
+    // cannot both land. Flagging these is the noise that would get this lint
+    // switched off.
+    let src = ABSORBING.replace(
+        "from = [\"Pending\", \"Stale\"]\nparams = [\"Changed\"]\neffect",
+        "from = [\"Pending\", \"Stale\"]\nto = \"Pending\"\nparams = [\"Changed\"]\neffect",
+    );
+    let automaton = parse_automaton(&src).expect("parses");
+    let findings = lint_automaton(&automaton);
+    // `Observe` now lands in `Pending`, which `Adopt` also fires from, so the
+    // hazard survives -- assert the lint still sees it, then close the door.
+    assert!(
+        findings.iter().any(|f| f.code == "absorbing_effect"),
+        "landing back in a state Adopt fires from is still a race: {findings:#?}"
+    );
+
+    let exits = ABSORBING.replace(
+        "from = [\"Pending\", \"Stale\"]\nparams = [\"Changed\"]\neffect",
+        "from = [\"Pending\", \"Stale\"]\nto = \"Analyzed\"\nparams = [\"Changed\"]\neffect",
+    );
+    let automaton = parse_automaton(&exits).expect("parses");
+    let findings = lint_automaton(&automaton);
+    assert!(
+        !findings.iter().any(|f| f.code == "absorbing_effect"),
+        "Observe exits every state Adopt fires from, so only one can apply: {findings:#?}"
+    );
+}
+
+#[test]
+fn guard_exclusion_prevents_absorbing_effect_warning() {
+    let guarded = ABSORBING.replace(
+        "name = \"Adopt\"",
+        "name = \"Adopt\"\nguard = \"!has_verdict\"",
+    );
+    for (effect, should_warn) in [
+        ("has_verdict = true", false),
+        ("has_verdict = false", true),
+        ("has_verdict = true\", \"has_verdict = params.Changed", true),
+    ] {
+        let source = guarded.replace(
+            "content_changed = params.Changed",
+            &format!("content_changed = params.Changed\", \"{effect}"),
+        );
+        let findings = lint_automaton(&parse_automaton(&source).unwrap());
+        assert_eq!(
+            findings.iter().any(|f| f.code == "absorbing_effect"),
+            should_warn,
+            "{source}\n{findings:#?}"
+        );
+    }
+}

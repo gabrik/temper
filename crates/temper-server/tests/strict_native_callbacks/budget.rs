@@ -182,6 +182,14 @@ module = "failing_job"
                             .is_some_and(|reason| reason.contains("callback hop"))
                 });
             if refused {
+                // The refusal can arrive after the earlier snapshot was taken.
+                // Check the completed chain using state read after that signal.
+                let ticks = state
+                    .get_tenant_entity_state(&tenant, "Job", "job")
+                    .await
+                    .unwrap()
+                    .state
+                    .counters["ticks"];
                 assert_eq!(
                     ticks, 13,
                     "budget must allow all twelve remaining compensations"
@@ -461,6 +469,14 @@ on_success = "Tick"
                             .is_some_and(|reason| reason.contains("callback hop"))
                 });
             if refused {
+                // The refusal can arrive after the earlier snapshot was taken.
+                // Check the completed chain using state read after that signal.
+                let ticks = state
+                    .get_tenant_entity_state(&tenant, "Job", "job")
+                    .await
+                    .unwrap()
+                    .state
+                    .counters["ticks"];
                 assert_eq!(
                     ticks, 13,
                     "budget must allow all twelve remaining callbacks"

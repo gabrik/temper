@@ -84,6 +84,17 @@ pub struct SimulationResult {
     pub total_messages: u64,
     /// Total messages dropped (by fault injection).
     pub total_dropped: u64,
+    /// Deliveries refused because the action was not enabled on arrival.
+    ///
+    /// A fault-delayed message can land after its target has changed state, by
+    /// which point the spec may no longer permit the action. Those deliveries
+    /// are skipped rather than applied, and counted here so the skipping is
+    /// observable: a run that rejects nearly everything is exploring far less
+    /// than its transition count suggests.
+    ///
+    /// `#[serde(default)]` so a result from an older server still decodes.
+    #[serde(default)]
+    pub total_rejected: u64,
     /// Any invariant violations found.
     pub violations: Vec<InvariantViolation>,
     /// Any liveness violations found.
@@ -172,6 +183,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
     let mut violations = Vec::new();
     let mut total_transitions: u64 = 0;
     let mut total_messages: u64 = 0;
+    let mut total_rejected: u64 = 0;
 
     // Main simulation loop
     for tick in 0..config.max_ticks {
@@ -222,6 +234,21 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
                 Err(_) => continue,
             };
 
+            // Re-evaluate the precondition against the state the actor is in
+            // *now*, not the one it was in when the action was chosen. The
+            // scheduler may have held this message for up to `max_delay_ticks`,
+            // during which the actor moved on, and `next_state` resolves a
+            // transition by name without rechecking anything. Applying it
+            // anyway fabricates a transition the spec forbids, and the
+            // invariant it breaks is reported as a real violation -- a phantom
+            // that reads exactly like a genuine bug and costs a spec bisect to
+            // dismiss. Production refuses a late write with a 409 for the same
+            // reason, so counting it as rejected is the faithful model.
+            if !model.action_enabled(state_before, &action) {
+                total_rejected += 1;
+                continue;
+            }
+
             if let Some(new_state) = model.next_state(state_before, action.clone()) {
                 check_invariants_on_state(
                     model,
@@ -251,6 +278,7 @@ fn run_simulation_impl(model: &TemperModel, config: &SimConfig) -> SimulationRes
         total_transitions,
         total_messages,
         total_dropped: sched.total_dropped() as u64,
+        total_rejected,
         violations,
         liveness_violations,
         seed: config.seed,
@@ -371,6 +399,48 @@ mod tests {
     use super::*;
 
     const ORDER_IOA: &str = include_str!("../../../test-fixtures/specs/order.ioa.toml");
+    const LATE_DELIVERY_IOA: &str =
+        include_str!("../../../test-fixtures/specs/late_delivery.ioa.toml");
+
+    /// A fault-delayed action must not be applied where it is not enabled.
+    ///
+    /// The simulator chooses an action that is legal in the actor's state *now*,
+    /// hands it to a scheduler that may delay it by up to 20 ticks, and applies
+    /// it on delivery -- by which time the actor has moved on. Production
+    /// re-evaluates a late write against the entity's current state and refuses
+    /// it with a 409, so an execution that applies one models nothing that can
+    /// happen, and any violation it reports is a phantom.
+    ///
+    /// `late_delivery.ioa.toml` has no legal execution that breaks its
+    /// invariant, so this asserts on a property of the checker rather than of
+    /// the spec: every reported violation is a false positive by construction.
+    #[test]
+    fn delayed_actions_are_not_applied_outside_their_from_states() {
+        let config = SimConfig {
+            seed: 7,
+            max_ticks: 400,
+            num_actors: 3,
+            max_actions_per_actor: 40,
+            max_counter: 2,
+            faults: FaultConfig::heavy(),
+        };
+
+        let results = run_multi_seed_simulation_from_ioa(LATE_DELIVERY_IOA, &config, 20).unwrap();
+
+        let phantoms: Vec<_> = results
+            .iter()
+            .flat_map(|r| r.violations.iter().map(move |v| (r.seed, v)))
+            .collect();
+        assert!(
+            phantoms.is_empty(),
+            "no legal execution can break SealedMeansFlagClear, so these are \
+             transitions applied outside their from-states: {phantoms:#?}"
+        );
+        assert!(
+            results.iter().any(|r| r.total_transitions > 0),
+            "fixture applied no transitions at all, so it proves nothing"
+        );
+    }
 
     #[test]
     fn test_simulation_no_faults() {
