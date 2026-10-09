@@ -41,7 +41,8 @@ mod idempotency_replay {
     use super::actor::{EntityActor, ReplayPolicy, ReplayTarget};
     use super::types::{EntityEvent, EntityResponse, EntityState};
     use crate::idempotency::{
-        IDEMPOTENCY_KEY_MISMATCH, IDEMPOTENCY_KEY_UNVERIFIABLE, result_digest, unqualified_action,
+        IDEMPOTENCY_KEY_MISMATCH, IDEMPOTENCY_KEY_UNVERIFIABLE, IDEMPOTENCY_REPLY_UNVERIFIABLE,
+        result_digest, unqualified_action,
     };
 
     /// Outcome of resolving a key that already produced a durable event.
@@ -50,9 +51,10 @@ mod idempotency_replay {
         Original(Box<EntityState>),
         /// The key was used for a different action or body.
         Mismatch,
-        /// The key is recorded but its original request or result cannot be
-        /// verified (missing event or provenance, or transition-rule drift).
+        /// The key is recorded but its original request cannot be verified.
         Unverifiable,
+        /// The request matches; the logical reply or completion is unproven.
+        ReplyUnverifiable,
     }
 
     /// Does `event` (which carries the request's key) record this same request?
@@ -93,10 +95,13 @@ mod idempotency_replay {
             return ProcessedKeyResolution::Mismatch;
         }
         match event.idempotency_result.as_deref() {
-            Some(recorded) if recorded == result_digest(&candidate) => {
+            Some(recorded)
+                if recorded == result_digest(&candidate)
+                    && crate::idempotency::verifies_core_reply(event, binding, recorded) =>
+            {
                 ProcessedKeyResolution::Original(Box::new(candidate))
             }
-            _ => ProcessedKeyResolution::Unverifiable,
+            _ => ProcessedKeyResolution::ReplyUnverifiable,
         }
     }
 
@@ -106,7 +111,6 @@ mod idempotency_replay {
         pub(super) action: &'a str,
         pub(super) params: &'a Value,
         pub(super) binding: &'a str,
-        pub(super) related: &'a temper_jit::table::RelatedMap,
     }
 
     /// Failed reply for a mismatched or unverifiable key. Appends nothing.
@@ -200,7 +204,6 @@ mod idempotency_replay {
                 action,
                 params,
                 binding,
-                related,
             } = request;
             let original = match self
                 .resolve_processed_idempotency_key(table, state, key, action, params, binding)
@@ -213,18 +216,17 @@ mod idempotency_replay {
                 ProcessedKeyResolution::Unverifiable => {
                     return idempotency_rejection(state, IDEMPOTENCY_KEY_UNVERIFIABLE);
                 }
+                ProcessedKeyResolution::ReplyUnverifiable => {
+                    return idempotency_rejection(state, IDEMPOTENCY_REPLY_UNVERIFIABLE);
+                }
             };
-            let custom_effects =
-                super::actor::duplicate_idempotency_custom_effects(table, state, action, related);
-            let mut response_state = *original;
-            if !custom_effects.is_empty() {
-                super::effects::prune_transient_action_fields_from_state(&mut response_state);
-            }
+            // A proven historical core reply carries no new transition work.
+            let response_state = *original;
             let response = EntityResponse {
                 success: true,
                 state: response_state,
                 error: None,
-                custom_effects,
+                custom_effects: vec![],
                 scheduled_actions: vec![],
                 spawn_requests: vec![],
                 spec_governed: true,

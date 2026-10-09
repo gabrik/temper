@@ -128,8 +128,8 @@ pub enum DispatchError {
     #[error("idempotency key mismatch: {0}")]
     IdempotencyKeyMismatch(String),
 
-    /// The `Idempotency-Key` was already used but its original request cannot
-    /// be verified from the journal (ADR-0182). Fails closed; nothing was
+    /// The `Idempotency-Key` was already used but its request or logical reply
+    /// cannot be verified from the journal. Fails closed; nothing was
     /// appended.
     #[error("idempotency key unverifiable: {0}")]
     IdempotencyKeyUnverifiable(String),
@@ -150,10 +150,9 @@ impl DispatchError {
             crate::idempotency::IDEMPOTENCY_KEY_MISMATCH => Some(Self::IdempotencyKeyMismatch(
                 crate::idempotency::IDEMPOTENCY_KEY_MISMATCH.to_string(),
             )),
-            crate::idempotency::IDEMPOTENCY_KEY_UNVERIFIABLE => {
-                Some(Self::IdempotencyKeyUnverifiable(
-                    crate::idempotency::IDEMPOTENCY_KEY_UNVERIFIABLE.to_string(),
-                ))
+            message @ (crate::idempotency::IDEMPOTENCY_KEY_UNVERIFIABLE
+            | crate::idempotency::IDEMPOTENCY_REPLY_UNVERIFIABLE) => {
+                Some(Self::IdempotencyKeyUnverifiable(message.to_string()))
             }
             _ => None,
         }

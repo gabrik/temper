@@ -522,6 +522,7 @@ impl crate::state::ServerState {
                 idempotency_key: None,
                 idempotency_binding: None,
                 idempotency_result: None,
+                idempotency_reply: None,
             };
             events.push(composite_envelope(&persistence_id, &bootstrap, &state)?);
             state.sequence_nr = state.sequence_nr.saturating_add(1);
@@ -860,6 +861,7 @@ impl crate::state::ServerState {
                 idempotency_key: None,
                 idempotency_binding: None,
                 idempotency_result: None,
+                idempotency_reply: None,
             };
             stream.state.sequence_nr += 1;
             stream.state.push_event_bounded(created);

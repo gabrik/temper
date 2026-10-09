@@ -178,14 +178,13 @@ async fn historical_idempotency_retry_preserves_current_state_and_does_not_repea
         let cache = cold.entity_state_cache.lock().unwrap().clone();
         let mut events = cold.event_tx.subscribe();
         for _ in 0..2 {
-            let retry = cold
+            let error = cold
                 .dispatch_tenant_action(&tenant, "TimedTask", "task", "Start", json!({}), &agent)
                 .await
-                .unwrap();
-            assert!(retry.success, "seed {seed}: {retry:?}");
-            assert_eq!(
-                retry.state.status, "Running",
-                "reply is the historical result"
+                .expect_err("cold dispatcher history lacks final reply proof");
+            assert!(
+                error.contains("IdempotencyKeyUnverifiable"),
+                "seed {seed}: {error}"
             );
             let current = cold
                 .get_tenant_entity_state(&tenant, "TimedTask", "task")

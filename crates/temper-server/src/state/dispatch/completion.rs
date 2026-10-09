@@ -64,11 +64,11 @@ impl crate::state::ServerState {
                 return result;
             }
             OperationClaim::Historical => {
-                let mut workflow = CompletionWorkflow::new(self, &request, &response);
-                let response = self
-                    .run_replayed_integrations(&request.effects_context(), response)
-                    .await;
-                workflow.finish(&response);
+                let mut response = response;
+                response.custom_effects.clear();
+                response.scheduled_actions.clear();
+                response.spawn_requests.clear();
+                CompletionWorkflow::new(self, &request, &response).finish(&response);
                 return CompletionResult::response(response);
             }
             OperationClaim::Owner(owner) => owner,
@@ -280,3 +280,11 @@ mod precheck_tests;
 #[cfg(test)]
 #[path = "completion_compensation_test.rs"]
 mod compensation_tests;
+
+#[cfg(test)]
+#[path = "completion_reply_proof_test.rs"]
+mod reply_proof_tests;
+
+#[cfg(test)]
+#[path = "completion_native_reply_test.rs"]
+mod native_reply_tests;

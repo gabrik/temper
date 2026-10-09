@@ -32,6 +32,7 @@ pub async fn legacy_copy(
         .map(|mut env| {
             if let Some(obj) = env.payload.as_object_mut() {
                 obj.remove(BINDING_FIELD);
+                obj.remove("idempotency_reply");
             }
             env
         })

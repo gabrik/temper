@@ -288,6 +288,7 @@ async fn dst_update_fields_rejects_stale_authorization_without_a_journal() {
     let cancelled: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "test"}),
                 related: BTreeMap::new(),
@@ -385,6 +386,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let stale: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "stale"}),
                 related: BTreeMap::new(),
@@ -403,6 +405,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let applied: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
@@ -419,6 +422,7 @@ async fn dst_action_rejects_stale_authorization_but_allows_idempotent_reply() {
     let retry: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".to_string(),
                 params: serde_json::json!({"Reason": "fresh"}),
                 related: BTreeMap::new(),
@@ -479,6 +483,7 @@ async fn dst_add_item_then_submit() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "AddItem".into(),
                 params: serde_json::json!({"ProductId": "prod-1"}),
                 related: std::collections::BTreeMap::new(),
@@ -497,6 +502,7 @@ async fn dst_add_item_then_submit() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "SubmitOrder".into(),
                 params: serde_json::json!({"ShippingAddressId": "addr-1"}),
                 related: std::collections::BTreeMap::new(),
@@ -513,7 +519,7 @@ async fn dst_add_item_then_submit() {
 }
 
 #[tokio::test]
-async fn duplicate_composite_idempotency_reemits_spec_trigger() {
+async fn duplicate_composite_core_history_does_not_reemit_spec_trigger() {
     let system = ActorSystem::new("composite-idempotency");
     let actor = EntityActor::new(
         "Repository",
@@ -531,6 +537,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
     let first: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "IngestPack".into(),
                 params: params.clone(),
                 related: std::collections::BTreeMap::new(),
@@ -549,6 +556,7 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
     let duplicate: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "IngestPack".into(),
                 params,
                 related: std::collections::BTreeMap::new(),
@@ -560,9 +568,9 @@ async fn duplicate_composite_idempotency_reemits_spec_trigger() {
         .await
         .unwrap();
 
-    assert_eq!(
-        duplicate.custom_effects,
-        vec!["__trigger__:IngestPack:scm_ingest_pack"]
+    assert!(
+        duplicate.custom_effects.is_empty(),
+        "historical core reply must not launch current integrations"
     );
     assert!(duplicate.state.fields.get("PackBytes").is_none());
     assert!(duplicate.state.fields.get("RefUpdates").is_none());
@@ -585,6 +593,7 @@ async fn dst_cannot_submit_without_items() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "SubmitOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -629,6 +638,7 @@ async fn dst_full_order_lifecycle() {
         let r: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                     name: action.into(),
                     params,
                     related: std::collections::BTreeMap::new(),
@@ -665,6 +675,7 @@ async fn dst_cancel_from_draft() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({"Reason": "changed mind"}),
                 related: std::collections::BTreeMap::new(),
@@ -697,6 +708,7 @@ async fn dst_cannot_cancel_shipped_order() {
         let _: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                     name: action.to_string(),
                     params: serde_json::json!({}),
                     related: std::collections::BTreeMap::new(),
@@ -713,6 +725,7 @@ async fn dst_cannot_cancel_shipped_order() {
     let r: EntityResponse = actor_ref
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -746,6 +759,7 @@ async fn dst_multiple_actors_independent() {
     let _: EntityResponse = a1
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "CancelOrder".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -761,6 +775,7 @@ async fn dst_multiple_actors_independent() {
     let _: EntityResponse = a2
         .ask(
             EntityMsg::Action {
+                reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                 name: "AddItem".into(),
                 params: serde_json::json!({}),
                 related: std::collections::BTreeMap::new(),
@@ -1632,6 +1647,7 @@ async fn reserved_field_update_event_names_are_refused_as_actions() {
         let response: EntityResponse = actor_ref
             .ask(
                 EntityMsg::Action {
+                    reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                     name: reserved.to_string(),
                     params: serde_json::json!({"Customer": "Mallory"}),
                     related: BTreeMap::new(),
@@ -2562,6 +2578,7 @@ async fn replay_skip_of_a_field_update_event_is_counted() {
         idempotency_key: None,
         idempotency_binding: None,
         idempotency_result: None,
+        idempotency_reply: None,
     };
     let created_env = PersistenceEnvelope {
         sequence_nr: 1,
@@ -2859,16 +2876,22 @@ on_timeout = "TimeoutFail"
         // counted until it wakes. A replay must not spawn another timer.
         let timers_before = pending_timers(&server);
         let mut changes = server.event_tx.subscribe();
-        let replay = act(&server, id, "Start", json!({}), "k-start")
-            .await
-            .expect("REVIEW-523-1: retry of the first key must not error");
+        let replay = act(&server, id, "Start", json!({}), "k-start").await;
 
-        assert!(
-            replay.success && logical(&replay) == logical(&original),
-            "REVIEW-523-1: retry must return the ORIGINAL response.\n original: {}\n got: {}",
-            logical(&original),
-            logical(&replay)
-        );
+        if cold {
+            assert!(
+                matches!(replay, Err(DispatchError::IdempotencyKeyUnverifiable(_))),
+                "cold dispatcher reply has no completion proof: {replay:?}"
+            );
+        } else {
+            let replay = replay.expect("warm retained reply must stay available");
+            assert!(
+                replay.success && logical(&replay) == logical(&original),
+                "REVIEW-523-1: retry must return the ORIGINAL response.\n original: {}\n got: {}",
+                logical(&original),
+                logical(&replay)
+            );
+        }
         assert_eq!(
             pending_timers(&server),
             timers_before,
@@ -3095,18 +3118,17 @@ on_timeout = "TimeoutFail"
     }
 
     #[tokio::test]
-    async fn review_523_3_racing_identical_requests_return_original_once() {
+    async fn review_523_3_racing_identical_without_retained_reply_is_unverifiable() {
         let race = racing_writers("a").await;
         assert_loser_committed_nothing(&race).await;
-        let loser = race
-            .loser
-            .as_ref()
-            .expect("REVIEW-523-3: identical losing request must not error");
+        assert!(race.winner.success, "the retained winner still succeeds");
         assert!(
-            loser.success && logical(loser) == logical(&race.winner),
-            "REVIEW-523-3: identical losing request must return the ORIGINAL response.\n original: {}\n got: {}",
-            logical(&race.winner),
-            logical(loser)
+            matches!(
+                race.loser,
+                Err(DispatchError::IdempotencyKeyUnverifiable(_))
+            ),
+            "independent loser has no retained final reply: {:?}",
+            race.loser
         );
     }
 }

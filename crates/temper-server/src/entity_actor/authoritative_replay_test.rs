@@ -105,6 +105,7 @@ fn envelope(
         idempotency_key: None,
         idempotency_binding: None,
         idempotency_result: None,
+        idempotency_reply: None,
     };
     PersistenceEnvelope {
         sequence_nr,
@@ -351,6 +352,7 @@ async fn authoritative_replay_rejects_non_object_field_update_payloads() {
         idempotency_key: None,
         idempotency_binding: None,
         idempotency_result: None,
+        idempotency_reply: None,
     };
     let non_object = PersistenceEnvelope {
         sequence_nr: 1,

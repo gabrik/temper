@@ -42,20 +42,19 @@ async fn legacy_setup(seed: u64, extra_processed_keys: &[&str]) -> (Harness, Rep
 }
 
 #[tokio::test]
-async fn legacy_journal_and_snapshot_same_request_returns_original() {
+async fn legacy_unscoped_journal_and_snapshot_same_request_is_unverifiable() {
     let (_g, _c, _i) = install_deterministic_context(5271);
-    let (h, original, before) = legacy_setup(5271, &[]).await;
+    let (h, _original, before) = legacy_setup(5271, &[]).await;
     let retry = h
         .action(TENANT_A, ORDER, "Temper.AddItem", Some(K1), EQUIVALENT)
         .await;
-    assert!(
-        retry.status == StatusCode::OK && logical(&retry.body) == logical(&original.body),
-        "{MARK}: legacy journal+snapshot: same-logical retry must return the ORIGINAL response.\n \
-         status: {}\n original: {}\n got: {}",
+    assert_eq!(
         retry.status,
-        logical(&original.body),
-        logical(&retry.body)
+        StatusCode::CONFLICT,
+        "legacy reply has no authority proof: {}",
+        retry.body
     );
+    assert_eq!(retry.error_code(), Some("IdempotencyKeyUnverifiable"));
     assert_eq!(
         h.journal_len(TENANT_A, ORDER),
         before,
@@ -101,6 +100,12 @@ async fn legacy_snapshot_key_without_event_fails_closed() {
             SECOND,
         )
         .await;
+    assert!(
+        reply.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("original request cannot be verified")
+    );
     let after = h.journal_len(TENANT_A, ORDER);
     assert_rejected(
         &reply,

@@ -272,3 +272,68 @@ actor/initialization quiescence, proof of non-application, or terminal execution
 of a PostgreSQL tell/202 enqueue. Those pre-adoption and existing asynchronous
 milestones remain outside this correction. Typed uncertainty from an already
 adopted descendant must survive ordinary HTTP errors and denial responses.
+
+### Published-review correction: versioned cold reply authority
+
+The parent authorized this bounded candidate after the operator requested that
+PR523 be unblocked. This is development authorization, not an assertion that the
+owner explicitly chose a design or that this Proposed ADR is organizationally
+accepted. Old cold-retry availability changes deliberately: missing, malformed,
+unsupported or unverifiable reply provenance returns IdempotencyKeyUnverifiable
+(409), after authorization and binding-mismatch checks.
+
+An actor's committed state digest does not prove a dispatcher's logical reply.
+Inline WASM/native callbacks can change that reply; even a pure/background
+request can fail required projection, reaction or completion-capacity work after
+commit. Therefore all dispatcher entry points are conservatively classified as
+requiring post-completion proof. Only truly direct actor replies are
+core-authoritative; atomic composite child writes also require post-completion
+proof, as explained below. This intentionally refuses cold
+retries of dispatcher-origin pure/background actions too. Warm retained
+receipts keep their original result and milestones. We do not persist a new
+completion/finalization record or claim restart exactly-once/reaction recovery.
+
+New keyed events atomically carry a versioned reply proof alongside their
+binding and core-state digest. Its domain-separated hash binds the key, binding,
+core digest, reply class and trusted first mode. The first dispatcher mode
+includes integration waiting and reaction scope/waiting; it is carried in the
+internal actor message and frozen for later pending-receipt adoption. No request
+header/parameter supplies this proof. Direct actor callers explicitly request
+only the actor reply. Optimistic-concurrency retries stamp the work they actually
+commit with the same rules; atomic composite subwrites explicitly record
+Composite/PostCompletion rather than certifying their post-append projection.
+
+Recovery checks stored proof, binding and reconstructed core digest, never
+today's trigger declarations, current state or independent correlation UUIDs.
+Raw optional proof JSON allows legacy and malformed proofs to hydrate normally
+then fail closed on key reuse, including snapshots. Core-authoritative history
+returns the original prefix with no new custom integrations/reactions/timers/
+spawns. The former historical-composite integration exception is withdrawn;
+legitimate process-local owned/pending completion is not disabled. Ambiguous old
+records cannot retroactively acquire authority from a changed spec, nor from
+this new format. A future durable-final-reply design would still need an explicit
+legacy policy and is outside this correction.
+
+The compatibility loss also applies to an optimistic-concurrency loser on an
+independent server: catching up the winning dispatcher event proves the commit,
+not the winning server's final reply. Identical requests without its retained
+receipt therefore refuse with `IdempotencyKeyUnverifiable`; different requests
+still fail binding comparison first. Same-process retained receipts and warm
+responses remain available. The deliberately removed-receipt fault likewise
+cannot turn its initial unknown outcome into a later historical success.
+
+The bounded classification also records an explicit `Composite` mode for atomic
+composite child/sub-write keys. This is **PostCompletion**, not DirectCore:
+`append_batch` proves core commitment, but the mandatory query projection runs
+after it and can fail. Even an ordinarily successful composite child key cannot
+provide a cold reply without final completion proof. Neither a parent proof nor
+another child's stamp proves this child's projection or whole-composite success.
+This intentional availability cost avoids inventing an authoritative child-reply
+contract. Strict positive cold replies remain possible for truly direct actor
+boundaries (including direct composite-parent core calls); no required post-core
+work is certified by their core proof.
+
+Known matching requests with unproven logical reply/completion receive an
+explicit reply/completion diagnostic, distinct from a key whose original
+request cannot be verified. Both retain HTTP 409 `IdempotencyKeyUnverifiable`;
+this does not turn a proved binding into proof of a final outcome.

@@ -1299,6 +1299,7 @@ impl ServerState {
             idempotency_key: None,
             idempotency_binding: None,
             idempotency_result: None,
+            idempotency_reply: None,
         };
         let payload = crate::entity_actor::bootstrap::event_payload(&created, &state)
             .map_err(|e| format!("failed to serialize Created event: {e}"))?;

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use temper_jit::table::{Effect, TransitionTable};
+use temper_jit::table::TransitionTable;
 use temper_observe::wide_event;
 use temper_runtime::actor::{Actor, ActorContext, ActorError};
 use temper_runtime::persistence::{
@@ -36,7 +36,7 @@ pub(super) use tokio::time::sleep as sleep_persistence_retry; // determinism-ok:
 use crate::storage::{BackendLabel, BoxedEventStore};
 
 use super::action_input::process_action_with_blob_prestate;
-use super::effects::{FieldSyncMode, build_eval_context_with_xref};
+use super::effects::FieldSyncMode;
 use super::idempotency_replay::{DuplicateRequest, idempotency_rejection};
 use super::snapshot_queue::{SnapshotEnqueueOutcome, SnapshotWriteQueue};
 use super::types::{
@@ -89,33 +89,6 @@ pub(super) fn event_budget_workspace_id(state: &EntityState) -> String {
     }
 
     String::new()
-}
-
-pub(super) fn duplicate_idempotency_custom_effects(
-    table: &TransitionTable,
-    state: &EntityState,
-    action: &str,
-    related: &temper_jit::table::RelatedMap,
-) -> Vec<String> {
-    if !table.composite_actions.contains_key(action) {
-        return Vec::new();
-    }
-
-    let ctx = build_eval_context_with_xref(state, related, table, Some(action));
-    table
-        .evaluate_ctx(&state.status, &ctx, action)
-        .filter(|result| result.success)
-        .map(|result| {
-            result
-                .effects
-                .into_iter()
-                .filter_map(|effect| match effect {
-                    Effect::Custom(name) => Some(name),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The entity actor -- processes actions through a TransitionTable.
@@ -707,6 +680,7 @@ impl EntityActor {
                                 idempotency_key: None,
                                 idempotency_binding: None,
                                 idempotency_result: None,
+                                idempotency_reply: None,
                             },
                         };
                         state.status = tombstone.to_status.clone();
@@ -1084,6 +1058,7 @@ impl Actor for EntityActor {
                 idempotency_key: None,
                 idempotency_binding: None,
                 idempotency_result: None,
+                idempotency_reply: None,
             };
 
             if let (Some(store), Some(backend)) = (self.event_journal.as_ref(), self.event_backend)
@@ -1111,6 +1086,7 @@ impl Actor for EntityActor {
     ) -> Result<(), ActorError> {
         match msg {
             EntityMsg::Action {
+                reply_mode,
                 name,
                 params,
                 related,
@@ -1197,7 +1173,6 @@ impl Actor for EntityActor {
                         action: &name,
                         params: &params,
                         binding,
-                        related: &related,
                     };
                     let response = self
                         .idempotent_duplicate_reply(&table, state, request)
@@ -1317,11 +1292,11 @@ impl Actor for EntityActor {
                         .event
                         .clone()
                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
-                    event.idempotency_key = idempotency_key.clone();
-                    event.idempotency_binding = idempotency_binding.clone();
-                    event.idempotency_result = idempotency_key
-                        .as_ref()
-                        .map(|_| crate::idempotency::result_digest(state));
+                    if let Some(key) = idempotency_key.as_deref() {
+                        crate::idempotency::stamp_keyed_reply(
+                            &mut event, key, &name, &params, state, reply_mode,
+                        );
+                    }
 
                     if !result.overflow_blobs.is_empty()
                         && let Err(e) = Self::persist_overflow_blobs(
@@ -1454,7 +1429,6 @@ impl Actor for EntityActor {
                                             action: &name,
                                             params: &params,
                                             binding,
-                                            related: &related,
                                         };
                                         let response = self
                                             .idempotent_duplicate_reply(&table, state, request)
@@ -1500,11 +1474,16 @@ impl Actor for EntityActor {
                                         .clone()
                                         .expect("successful process_action always returns event"); // ci-ok: post-assertion, success guarantees Some
                                     let mut retry_event = retry_event;
-                                    retry_event.idempotency_key = idempotency_key.clone();
-                                    retry_event.idempotency_binding = idempotency_binding.clone();
-                                    retry_event.idempotency_result = idempotency_key
-                                        .as_ref()
-                                        .map(|_| crate::idempotency::result_digest(state));
+                                    if let Some(key) = idempotency_key.as_deref() {
+                                        crate::idempotency::stamp_keyed_reply(
+                                            &mut retry_event,
+                                            key,
+                                            &name,
+                                            &params,
+                                            state,
+                                            reply_mode,
+                                        );
+                                    }
 
                                     // Overflow blobs for the re-evaluated result.
                                     if !retry_result.overflow_blobs.is_empty()
@@ -1734,7 +1713,7 @@ impl Actor for EntityActor {
                         idempotency_binding.as_deref(),
                         self.idempotency_cache.as_ref(),
                     ) {
-                        cache.put(&actor_key, key, binding, response.clone());
+                        cache.put_committed(&actor_key, key, binding, response.clone(), reply_mode);
                     }
                     ctx.reply(response);
                 } else {
@@ -1874,6 +1853,7 @@ impl Actor for EntityActor {
                     idempotency_key: None,
                     idempotency_binding: None,
                     idempotency_result: None,
+                    idempotency_reply: None,
                 };
 
                 if let (Some(store), Some(backend)) =

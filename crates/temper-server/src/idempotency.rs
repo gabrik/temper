@@ -20,10 +20,14 @@ use crate::entity_actor::EntityResponse;
 /// Dispatch maps it to `DispatchError::IdempotencyKeyMismatch` (HTTP 422).
 pub const IDEMPOTENCY_KEY_MISMATCH: &str = "IdempotencyKeyMismatch: idempotency key was already used for a different action or request body";
 
-/// Actor reply error for a processed key whose request binding cannot be
+/// Actor reply error for a processed key whose original request cannot be
 /// verified from the journal. Dispatch maps it to
 /// `DispatchError::IdempotencyKeyUnverifiable` (HTTP 409).
 pub const IDEMPOTENCY_KEY_UNVERIFIABLE: &str = "IdempotencyKeyUnverifiable: idempotency key was already used but its original request cannot be verified";
+
+/// Actor reply error when the request matches, but its logical reply or required
+/// completion is unproven. The transport code remains IdempotencyKeyUnverifiable.
+pub const IDEMPOTENCY_REPLY_UNVERIFIABLE: &str = "IdempotencyKeyUnverifiable: committed request matches, but its original logical reply or completion cannot be verified";
 
 const REQUEST_BINDING_TAG: &[u8] = b"temper.idempotency.v1";
 
@@ -65,8 +69,9 @@ pub fn result_digest(state: &crate::entity_actor::EntityState) -> String {
     hex_digest(hasher)
 }
 
-/// Stamp an event committed under idempotency `key` with its request binding
-/// and immutable result provenance (ADR-0182). `state` is the post-commit state.
+/// Stamp an atomic composite sub-write with binding, state and reply provenance.
+/// `state` is the post-commit state, not proof of the required post-append
+/// projection. Such commits cannot certify a cold logical reply.
 pub fn stamp_keyed_commit(
     event: &mut crate::entity_actor::EntityEvent,
     key: &str,
@@ -74,9 +79,31 @@ pub fn stamp_keyed_commit(
     params: &serde_json::Value,
     state: &crate::entity_actor::EntityState,
 ) {
+    stamp_keyed_reply(
+        event,
+        key,
+        action,
+        params,
+        state,
+        ActionReplyMode::Composite,
+    );
+}
+
+/// Stamp the trusted first reply boundary in the same journal event as the commit.
+pub(crate) fn stamp_keyed_reply(
+    event: &mut crate::entity_actor::EntityEvent,
+    key: &str,
+    action: &str,
+    params: &serde_json::Value,
+    state: &crate::entity_actor::EntityState,
+    mode: ActionReplyMode,
+) {
     event.idempotency_key = Some(key.to_string());
-    event.idempotency_binding = Some(request_binding(action, params));
-    event.idempotency_result = Some(result_digest(state));
+    let binding = request_binding(action, params);
+    event.idempotency_binding = Some(binding.clone());
+    let core = result_digest(state);
+    event.idempotency_reply = Some(reply_proof::stamp(key, &binding, &core, mode));
+    event.idempotency_result = Some(core);
 }
 
 fn hex_digest(hasher: Sha256) -> String {
@@ -168,6 +195,7 @@ struct IdempotencyEntry {
     created_at: chrono::DateTime<chrono::Utc>,
     /// Receipt owning the effects and registered reaction obligation.
     effects: EffectsState,
+    first_reply_mode: Option<ActionReplyMode>,
 }
 
 impl IdempotencyEntry {
@@ -180,6 +208,8 @@ impl IdempotencyEntry {
 }
 
 mod effects;
+mod reply_proof;
+pub use reply_proof::ActionReplyMode;
 mod wait_graph;
 use effects::EffectsState;
 pub(crate) use effects::{
@@ -287,6 +317,7 @@ impl IdempotencyCache {
             binding,
             response,
             EffectsState::Pending,
+            None,
         );
     }
 
@@ -306,7 +337,28 @@ impl IdempotencyCache {
             binding,
             response,
             EffectsState::Historical,
+            None,
         );
+    }
+
+    /// Cache the actor commit with its immutable trusted first mode.
+    pub(crate) fn put_committed(
+        &self,
+        actor_key: &str,
+        idem_key: &str,
+        binding: &str,
+        mut response: EntityResponse,
+        mode: ActionReplyMode,
+    ) {
+        let effects = if mode == ActionReplyMode::DirectCore {
+            response.custom_effects.clear();
+            response.scheduled_actions.clear();
+            response.spawn_requests.clear();
+            EffectsState::Historical
+        } else {
+            EffectsState::Pending
+        };
+        self.insert(actor_key, idem_key, binding, response, effects, Some(mode));
     }
 
     fn insert(
@@ -316,6 +368,7 @@ impl IdempotencyCache {
         binding: &str,
         response: EntityResponse,
         effects: EffectsState,
+        first_reply_mode: Option<ActionReplyMode>,
     ) {
         let now = sim_now();
         let mut entries = self.entries.write().unwrap(); // ci-ok: infallible lock
@@ -367,6 +420,7 @@ impl IdempotencyCache {
                 binding: binding.to_string(),
                 created_at: now,
                 effects,
+                first_reply_mode,
             },
         );
     }
@@ -380,3 +434,14 @@ impl Default for IdempotencyCache {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether durable provenance authorizes the verified actor prefix as a reply.
+pub(crate) fn verifies_core_reply(
+    event: &crate::entity_actor::EntityEvent,
+    binding: &str,
+    core: &str,
+) -> bool {
+    event.idempotency_key.as_deref().is_some_and(|key| {
+        reply_proof::verifies_core(event.idempotency_reply.as_ref(), key, binding, core)
+    })
+}

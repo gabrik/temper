@@ -527,6 +527,7 @@ impl crate::state::ServerState {
             let outcome = retry::ask_with_backoff::<_, EntityResponse, _>(
                 &actor,
                 || EntityMsg::Action {
+                    reply_mode: crate::idempotency::ActionReplyMode::DirectCore,
                     name: "Revoke".to_string(),
                     params: serde_json::json!({}),
                     related: BTreeMap::new(),

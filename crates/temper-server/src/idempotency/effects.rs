@@ -381,6 +381,17 @@ impl IdempotencyCache {
         };
         match &entry.effects {
             EffectsState::Pending => {
+                let mut request = request;
+                if let Some(super::ActionReplyMode::Dispatch {
+                    await_integration,
+                    await_reactions,
+                    reaction_depth,
+                }) = entry.first_reply_mode
+                {
+                    request.await_integration = await_integration;
+                    request.reaction_depth = reaction_depth;
+                    request.detach_reactions = !await_reactions;
+                }
                 let receipt =
                     OperationReceipt::new(request, entry.response.clone(), self.wait_graph.clone());
                 entry.effects = EffectsState::Operation(receipt.clone());

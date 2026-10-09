@@ -21,14 +21,20 @@ async fn same_logical_request_returns_original(mode: Mode, seed: u64) {
             Some(super::harness::TESTER),
         ))
         .await;
-    assert!(
-        retry.status == StatusCode::OK && logical(&retry.body) == logical(&original.body),
-        "{MARK}: {mode:?}: same-key same-logical retry after an intervening action must return \
+    if mode == Mode::ColdRestart {
+        // Approved compatibility change: no durable final dispatcher reply.
+        assert_eq!(retry.status, StatusCode::CONFLICT);
+        assert_eq!(retry.error_code(), Some("IdempotencyKeyUnverifiable"));
+    } else {
+        assert!(
+            retry.status == StatusCode::OK && logical(&retry.body) == logical(&original.body),
+            "{MARK}: {mode:?}: same-key same-logical retry after an intervening action must return \
          the ORIGINAL response.\n status: {}\n original: {}\n got: {}",
-        retry.status,
-        logical(&original.body),
-        logical(&retry.body)
-    );
+            retry.status,
+            logical(&original.body),
+            logical(&retry.body)
+        );
+    }
     assert_eq!(
         h.journal_len(TENANT_A, ORDER),
         before,
@@ -42,7 +48,7 @@ async fn same_logical_request_returns_original_response_after_intervening_action
 }
 
 #[tokio::test]
-async fn same_logical_request_returns_original_response_after_intervening_action_cold() {
+async fn cold_dispatcher_reply_without_completion_proof_is_unverifiable() {
     same_logical_request_returns_original(Mode::ColdRestart, 5192).await;
 }
 
@@ -237,17 +243,22 @@ async fn failed_request_never_binds_key(mode: Mode, seed: u64) {
     let retry = h
         .action(TENANT_A, id, "Temper.Example.AddItem", Some(key), SECOND)
         .await;
-    assert_eq!(
-        retry.status,
-        StatusCode::OK,
-        "{mode:?}: retry should succeed: {}",
-        retry.body
-    );
-    assert_eq!(
-        logical(&retry.body),
-        logical(&applied.body),
-        "{mode:?}: retry should return the original response"
-    );
+    if mode == Mode::ColdRestart {
+        assert_eq!(retry.status, StatusCode::CONFLICT);
+        assert_eq!(retry.error_code(), Some("IdempotencyKeyUnverifiable"));
+    } else {
+        assert_eq!(
+            retry.status,
+            StatusCode::OK,
+            "{mode:?}: retry should succeed: {}",
+            retry.body
+        );
+        assert_eq!(
+            logical(&retry.body),
+            logical(&applied.body),
+            "{mode:?}: retry should return the original response"
+        );
+    }
     assert_eq!(
         h.journal_len(TENANT_A, id),
         empty + 1,

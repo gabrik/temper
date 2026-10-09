@@ -185,6 +185,7 @@ fn field_event(action: &str, state: &EntityState, fields: &Value) -> EntityEvent
         idempotency_key: None,
         idempotency_binding: None,
         idempotency_result: None,
+        idempotency_reply: None,
     }
 }
 

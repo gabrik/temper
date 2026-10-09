@@ -227,9 +227,9 @@ async fn missing_receipt_after_commit_does_not_launch_uncached_integration() {
     assert_eq!(action_count(&store, "Work", "Start"), 1);
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
     assert!(adapter.hashes.lock().unwrap().is_empty());
-    // The actor can reconstruct verified history, but it cannot invent the
-    // lost completion obligation or manufacture fresh integrations from it.
-    assert!(run(&state, "Work", true, true).await.success);
+    // Losing the receipt loses final reply authority, not just permission to
+    // restart effects. The committed core digest cannot manufacture success.
+    missing_receipt_retry_is_unverifiable(&state, &store, "Work").await;
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
     assert_eq!(action_count(&store, "Work", "Start"), 1);
 }
@@ -250,7 +250,7 @@ async fn missing_receipt_after_commit_does_not_launch_uncached_reactions() {
             .unwrap()
             .contains("action committed; completion receipt unavailable")
     );
-    assert!(run(&state, "Source", false, true).await.success);
+    missing_receipt_retry_is_unverifiable(&state, &store, "Source").await;
     for _ in 0..32 {
         tokio::task::yield_now().await;
     }
@@ -318,4 +318,62 @@ async fn ordinary_failed_reaction_is_terminal_not_a_redelivery_request() {
     );
     assert_eq!(action_count(&store, "Source", "Start"), 1);
     assert_eq!(action_count(&store, "Child", "Start"), 1);
+}
+
+async fn missing_receipt_retry_is_unverifiable(
+    state: &crate::ServerState,
+    store: &temper_store_sim::SimEventStore,
+    kind: &str,
+) {
+    let tenant = temper_runtime::tenant::TenantId::default();
+    let before = state
+        .get_tenant_entity_state(&tenant, kind, "one")
+        .await
+        .unwrap()
+        .state;
+    assert_eq!(before.status, "Running", "the original action committed");
+    let persistence_id = format!("default:{kind}:one");
+    let journal = serde_json::to_value(store.dump_journal(&persistence_id)).unwrap();
+    let event_count = store.total_events();
+    let error = state
+        .dispatch_tenant_action_ext_typed(
+            &temper_runtime::tenant::TenantId::default(),
+            kind,
+            "one",
+            "Start",
+            serde_json::json!({}),
+            crate::state::DispatchExtOptions {
+                agent_ctx: &crate::request_context::AgentContext {
+                    idempotency_key: Some("K".into()),
+                    ..crate::request_context::AgentContext::system()
+                },
+                await_integration: true,
+                await_reactions: true,
+            },
+        )
+        .await
+        .expect_err("lost receipt must not invent final success");
+    assert!(
+        matches!(
+            &error,
+            super::super::DispatchError::IdempotencyKeyUnverifiable(_)
+        ),
+        "{error:?}"
+    );
+    let after = state
+        .get_tenant_entity_state(&tenant, kind, "one")
+        .await
+        .unwrap()
+        .state;
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap(),
+        "refusal must not regress current actor state"
+    );
+    assert_eq!(
+        serde_json::to_value(store.dump_journal(&persistence_id)).unwrap(),
+        journal,
+        "refusal must not change the committed journal"
+    );
+    assert_eq!(store.total_events(), event_count, "no new writes elsewhere");
 }

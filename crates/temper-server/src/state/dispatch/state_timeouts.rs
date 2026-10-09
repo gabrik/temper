@@ -528,6 +528,7 @@ mod tests {
             idempotency_key: None,
             idempotency_binding: None,
             idempotency_result: None,
+            idempotency_reply: None,
         }
     }
 
